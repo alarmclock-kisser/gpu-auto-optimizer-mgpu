@@ -58,6 +58,28 @@ TEST_CASE("per-GPU profiles and settings survive a round-trip") {
     CHECK(to_json(c).find("\"quiet\"") != std::string::npos);
 }
 
+TEST_CASE("a session GPU selection uses that GPU's own saved profile") {
+    Config config;
+    config.selected_gpu = "GPU-4060";
+    DeviceSettings& first = ensure_device(config, "GPU-4060");
+    first.profile = sample();
+    first.profile->gpu = "GPU-4060";
+    DeviceSettings& second = ensure_device(config, "GPU-3060");
+    second.profile = sample();
+    second.profile->gpu = "GPU-3060";
+    second.profile->core_mhz = 150;
+
+    const std::string session_selection = "GPU-3060";
+    const std::string& active_gpu = effective_gpu_selection(config, session_selection);
+    const Profile* active_profile = find_profile(config, active_gpu);
+
+    CHECK(active_gpu == "GPU-3060");
+    REQUIRE(active_profile);
+    CHECK(active_profile->core_mhz == 150);
+    CHECK(config.selected_gpu == "GPU-4060");
+    CHECK(effective_gpu_selection(config, std::string{}) == "GPU-4060");
+}
+
 TEST_CASE("a config without profiles round-trips selected GPU fan settings") {
     Config c;
     c.selected_gpu = "GPU-1";

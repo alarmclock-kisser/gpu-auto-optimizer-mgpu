@@ -230,12 +230,12 @@ void gpu_card(const UiState& s, const UiActions& act) {
                                        [&](const app::GpuInfo& gpu) { return gpu.uuid == s.selected_gpu; });
     const std::string selected_label = selected == s.gpus.end()
                                            ? (s.selected_gpu.empty() ? "No NVIDIA GPU found" : "Selected GPU unavailable")
-                                           : "GPU " + std::to_string(selected->index) + "  |  " + selected->name;
+                                           : app::gpu_label(*selected);
     ImGui::SetNextItemWidth(std::max(em() * 10, ImGui::GetContentRegionAvail().x -
                                                         button_width(detect) - ImGui::GetStyle().ItemSpacing.x));
     if (ImGui::BeginCombo("##selected_gpu", selected_label.c_str())) {
         for (const app::GpuInfo& gpu : s.gpus) {
-            const std::string label = "GPU " + std::to_string(gpu.index) + "  |  " + gpu.name;
+            const std::string label = app::gpu_label(gpu);
             const bool is_selected = gpu.uuid == s.selected_gpu;
             if (ImGui::Selectable(label.c_str(), is_selected) && act.select_gpu) act.select_gpu(gpu.uuid);
             if (is_selected) ImGui::SetItemDefaultFocus();

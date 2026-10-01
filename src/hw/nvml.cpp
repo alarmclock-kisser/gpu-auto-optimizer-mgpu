@@ -228,6 +228,22 @@ std::string Nvml::GpuUuid(unsigned index) {
     return buf;
 }
 
+std::string Nvml::GpuPciBusId(unsigned index) {
+    nvmlDevice_t dev = nullptr;
+    nvml_pci_info_v3 info{};
+    if (!inited_ || !p_pci_info || p_byIndex(index, &dev) != NVML_SUCCESS ||
+        p_pci_info(dev, &info) != NVML_SUCCESS) {
+        error_ = "nvmlDeviceGetPciInfo_v3 failed";
+        return {};
+    }
+    const char* const bus_id = info.bus_id[0] ? info.bus_id : info.bus_id_legacy;
+    if (!bus_id[0]) {
+        error_ = "nvmlDeviceGetPciInfo_v3 returned an empty PCI bus address";
+        return {};
+    }
+    return bus_id;
+}
+
 std::optional<unsigned> Nvml::GpuBusId(unsigned index) {
     nvmlDevice_t dev = nullptr;
     nvml_pci_info_v3 info{};

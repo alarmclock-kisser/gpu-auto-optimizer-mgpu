@@ -34,6 +34,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -82,8 +83,10 @@ struct App {
     ULONGLONG hw_retry_at = 0;
     gao::GpuControl gpu;
     std::string selected_gpu;
+    std::string session_selected_gpu;
     std::optional<unsigned> selected_gpu_index;
     bool selected_gpu_bound = false;
+    bool persist_session_selection = false;
     std::string selected_gpu_error;
     std::unordered_map<std::string, std::unique_ptr<FanRuntime>> fans;
 
@@ -284,6 +287,10 @@ void fan_sync(const gao::Config& cfg) {
     g.ui.fan_max_temp_c = selected && selected->profile
                               ? gao::objectives_for(selected->profile->preset).max_temp_c
                               : 75;
+    if (!g.ui.elevated) {
+        g.ui.fan_state = {};
+        return;
+    }
     if (g.worker && g.worker->running()) {
         fan_release(g.selected_gpu);
         return;
@@ -339,24 +346,51 @@ void refresh_status(bool with_task) {
     if (g.nvml_ok) {
         g.ui.gpu_error.clear();
         g.ui.gpus = gao::app::enumerate_gpus(*g.nvml, &g.ui.gpu_error);
-        if (cfg.selected_gpu.empty() && !g.ui.gpus.empty()) {
-            cfg.selected_gpu = g.ui.gpus.front().uuid;
-            if (!gao::app::save_config(cfg)) note("Could not save the selected GPU.", true);
+        if (cfg.selected_gpu.empty() && g.session_selected_gpu.empty() && !g.ui.gpus.empty()) {
+            if (g.ui.elevated) {
+                cfg.selected_gpu = g.ui.gpus.front().uuid;
+                if (!gao::app::save_config(cfg)) note("Could not save the selected GPU.", true);
+            } else {
+                g.session_selected_gpu = g.ui.gpus.front().uuid;
+            }
         }
     } else {
         g.ui.gpus.clear();
         g.ui.gpu_error = g.nvml ? g.nvml->Error() : "NVML is not available";
     }
-    g.ui.selected_gpu = cfg.selected_gpu;
-    const gao::app::GpuInfo* selected = gpu_info(cfg.selected_gpu);
+    if (g.persist_session_selection && g.ui.elevated && g.nvml_ok) {
+        const std::string requested = g.session_selected_gpu;
+        const auto requested_gpu = std::find_if(g.ui.gpus.begin(), g.ui.gpus.end(),
+                                                [&](const gao::app::GpuInfo& gpu) { return gpu.uuid == requested; });
+        g.persist_session_selection = false;
+        if (requested_gpu == g.ui.gpus.end()) {
+            note("The GPU selected before elevation is no longer available; the saved selection was left unchanged.",
+                 true);
+            g.session_selected_gpu.clear();
+        } else if (cfg.selected_gpu == requested) {
+            g.session_selected_gpu.clear();
+        } else {
+            cfg.selected_gpu = requested;
+            if (gao::app::save_config(cfg)) {
+                note("Saved " + gao::app::gpu_label(*requested_gpu) + " as the selected GPU.");
+                g.session_selected_gpu.clear();
+            } else {
+                note("Could not save " + gao::app::gpu_label(*requested_gpu) +
+                         "; it remains selected for this session.",
+                     true);
+            }
+        }
+    }
+    const std::string& active_gpu = gao::effective_gpu_selection(cfg, g.session_selected_gpu);
+    g.ui.selected_gpu = active_gpu;
+    const gao::app::GpuInfo* selected = gpu_info(active_gpu);
     const std::optional<unsigned> next_index = selected ? std::optional<unsigned>(selected->index) : std::nullopt;
-    const bool target_changed =
-        g.selected_gpu != cfg.selected_gpu || g.selected_gpu_index != next_index;
+    const bool target_changed = g.selected_gpu != active_gpu || g.selected_gpu_index != next_index;
     const std::string previous_error = g.selected_gpu_error;
     if (target_changed || !g.selected_gpu_bound) {
         const std::string previous = g.selected_gpu;
-        if (!previous.empty() && previous != cfg.selected_gpu) fan_release(previous);
-        g.selected_gpu = cfg.selected_gpu;
+        if (!previous.empty() && previous != active_gpu) fan_release(previous);
+        g.selected_gpu = active_gpu;
         g.selected_gpu_index = next_index;
         g.selected_gpu_bound = false;
         g.gpu = {};
@@ -367,29 +401,31 @@ void refresh_status(bool with_task) {
                 g.gpu = *control;
                 g.selected_gpu_bound = true;
             } else {
-                g.selected_gpu_error = "Could not map this GPU between NVML and NVAPI: " + why;
+                g.selected_gpu_error = "Could not map " + gao::app::gpu_label(*selected) +
+                                       " between NVML and NVAPI: " + why;
             }
         } else if (selected && !g.nvapi_ok) {
-            g.selected_gpu_error = "NVAPI is not available";
+            g.selected_gpu_error = "NVAPI is not available for " + gao::app::gpu_label(*selected);
         }
         if (!g.selected_gpu_error.empty() && (target_changed || previous_error != g.selected_gpu_error))
             note(g.selected_gpu_error, true);
     }
     if (!g.selected_gpu_error.empty()) g.ui.gpu_error = g.selected_gpu_error;
-    else if (!selected && !cfg.selected_gpu.empty() && g.ui.gpu_error.empty())
-        g.ui.gpu_error = "The saved GPU selection is currently unavailable.";
+    else if (!selected && !active_gpu.empty() && g.ui.gpu_error.empty())
+        g.ui.gpu_error = active_gpu == cfg.selected_gpu ? "The saved GPU selection is currently unavailable."
+                                                        : "The session-selected GPU is currently unavailable.";
     g.ui.has_profiles = std::any_of(cfg.devices.begin(), cfg.devices.end(),
                                     [](const gao::DeviceSettings& device) { return device.profile.has_value(); });
     g.ui.profile.reset();
     g.ui.strikes = 0;
-    if (const gao::DeviceSettings* device = gao::find_device(cfg, cfg.selected_gpu)) {
+    if (const gao::DeviceSettings* device = gao::find_device(cfg, active_gpu)) {
         g.ui.profile = device->profile;
         g.ui.strikes = device->boot_strikes;
     }
     if (g.nvml_ok) {
         g.ui.driver = g.nvml->DriverVersion();
         g.ui.profile_driver_ok = g.ui.profile && !g.ui.driver.empty() && g.ui.driver == g.ui.profile->driver;
-        g.ui.profile_gpu_ok = g.ui.profile && !cfg.selected_gpu.empty() && cfg.selected_gpu == g.ui.profile->gpu;
+        g.ui.profile_gpu_ok = g.ui.profile && !active_gpu.empty() && active_gpu == g.ui.profile->gpu;
     } else {
         g.ui.driver.clear();
         g.ui.profile_driver_ok = false;
@@ -424,9 +460,11 @@ void act_restart_elevated() {
     wchar_t self[MAX_PATH];
     const DWORD n = GetModuleFileNameW(nullptr, self, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return;
+    const std::wstring parameters = g.selected_gpu.empty() ? std::wstring{} : L"--select-gpu=" + gao::widen(g.selected_gpu);
     SHELLEXECUTEINFOW sei{sizeof(sei)};
     sei.lpVerb = L"runas";
     sei.lpFile = self;
+    sei.lpParameters = parameters.empty() ? nullptr : parameters.c_str();
     sei.nShow = SW_SHOWNORMAL;
     // The elevated copy must not find our single-instance mutex: release it
     // first, and take it back if elevation is cancelled.
@@ -451,13 +489,24 @@ void act_select_gpu(const std::string& gpu_uuid) {
     if (refuse_while_tuning()) return;
     const gao::app::GpuInfo* selected = gpu_info(gpu_uuid);
     if (!selected) { note("That NVIDIA GPU is no longer available.", true); return; }
+    if (!g.ui.elevated) {
+        g.session_selected_gpu = gpu_uuid;
+        g.persist_session_selection = false;
+        note("Selected " + gao::app::gpu_label(*selected) +
+                 " for this session. Restart as administrator to save the selection.",
+             false);
+        refresh_status(false);
+        return;
+    }
     gao::Config cfg = gao::app::load_config();
     cfg.selected_gpu = gpu_uuid;
     if (!gao::app::save_config(cfg)) {
-        note("Could not save the selected GPU; the selection was not changed.", true);
+        note("Could not save " + gao::app::gpu_label(*selected) + "; the selection was not changed.", true);
         return;
     }
-    note("Selected GPU " + std::to_string(selected->index) + ": " + selected->name);
+    g.session_selected_gpu.clear();
+    g.persist_session_selection = false;
+    note("Selected " + gao::app::gpu_label(*selected));
     refresh_status(false);
 }
 
@@ -772,6 +821,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == g.tray_notice && g.tray_notice) {   // gao --reset / gao --apply in a shell
+        g.session_selected_gpu.clear();
+        g.persist_session_selection = false;
         const std::string selected_gpu = gao::app::load_config().selected_gpu;
         if (wp == static_cast<WPARAM>(gao::app::TrayNotice::TuneApplied)) {
             if (!selected_gpu.empty()) {
@@ -893,10 +944,30 @@ bool claim_single_instance(bool tray_mode) {
     return false;
 }
 
+std::optional<std::string> selected_gpu_argument(PWSTR cmdline) {
+    if (!cmdline) return std::nullopt;
+    const std::wstring_view arguments(cmdline);
+    constexpr std::wstring_view prefix = L"--select-gpu=";
+    if (!arguments.starts_with(prefix)) return std::nullopt;
+    const std::wstring_view value = arguments.substr(prefix.size());
+    if (value.empty() || value.find_first_of(L" \t") != std::wstring_view::npos) return std::nullopt;
+    std::string gpu_uuid;
+    gpu_uuid.reserve(value.size());
+    for (const wchar_t ch : value) {
+        if (ch < 0x21 || ch > 0x7e) return std::nullopt;
+        gpu_uuid.push_back(static_cast<char>(ch));
+    }
+    return gpu_uuid;
+}
+
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
     SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (const auto requested_gpu = selected_gpu_argument(cmdline)) {
+        g.session_selected_gpu = *requested_gpu;
+        g.persist_session_selection = true;
+    }
     const bool tray_mode = cmdline && std::wcsstr(cmdline, L"--tray");
     if (!claim_single_instance(tray_mode)) return 0;
 

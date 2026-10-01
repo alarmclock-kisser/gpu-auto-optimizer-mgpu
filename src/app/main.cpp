@@ -58,17 +58,24 @@ static int probe() {
         std::printf("NVML device count failed: %s\n", nvml.Error().c_str());
         return 1;
     }
-    std::printf("GPUs: %d\n", count);
+    std::printf("GPUs: %d (NVML indices)\n", count);
     for (int i = 0; i < count; ++i) {
-        const gao::Telemetry t = nvml.Read(static_cast<unsigned>(i));
-        if (!t.ok) { std::printf("  [%d] read failed\n", i); continue; }
+        const unsigned index = static_cast<unsigned>(i);
+        const std::string name = nvml.DeviceName(index);
+        const std::string uuid = nvml.GpuUuid(index);
+        const std::string pci_bus_id = nvml.GpuPciBusId(index);
+        const gao::Telemetry t = nvml.Read(index);
+        const char* const gpu_name = name.empty() ? "NVIDIA GPU" : name.c_str();
+        const char* const pci = pci_bus_id.empty() ? "unknown" : pci_bus_id.c_str();
+        if (!t.ok) {
+            std::printf("  [%d] %s (%s, PCI %s) telemetry read failed\n", i, gpu_name, uuid.c_str(), pci);
+            continue;
+        }
         // Each field is -1 when the driver did not report it, even when t.ok.
-        const std::string name = nvml.DeviceName(static_cast<unsigned>(i));
-        const std::string uuid = nvml.GpuUuid(static_cast<unsigned>(i));
-        std::printf("  [%d] %s (%s) core=%s MHz  mem=%s MHz  temp=%s C  fan=%s  power=%s/%d W\n", i,
-                    name.empty() ? "NVIDIA GPU" : name.c_str(), uuid.c_str(),
-                    gao::reading(t.core_mhz).c_str(), gao::reading(t.mem_mhz).c_str(), gao::reading(t.temp_c).c_str(),
-                    gao::reading(t.fan_pct, "%").c_str(), gao::reading(t.power_w).c_str(), t.power_limit_w);
+        std::printf("  [%d] %s (%s, PCI %s) core=%s MHz  mem=%s MHz  temp=%s C  fan=%s  power=%s/%d W\n", i,
+                    gpu_name, uuid.c_str(), pci, gao::reading(t.core_mhz).c_str(), gao::reading(t.mem_mhz).c_str(),
+                    gao::reading(t.temp_c).c_str(), gao::reading(t.fan_pct, "%").c_str(),
+                    gao::reading(t.power_w).c_str(), t.power_limit_w);
     }
     return 0;
 }

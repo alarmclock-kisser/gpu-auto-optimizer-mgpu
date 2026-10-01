@@ -153,6 +153,10 @@ Config from_json(const std::string& text) {
     return c;
 }
 
+const std::string& effective_gpu_selection(const Config& config, const std::string& session_selection) {
+    return session_selection.empty() ? config.selected_gpu : session_selection;
+}
+
 const DeviceSettings* find_device(const Config& c, const std::string& gpu) {
     const auto it = std::find_if(c.devices.begin(), c.devices.end(),
                                  [&](const DeviceSettings& d) { return d.gpu == gpu; });

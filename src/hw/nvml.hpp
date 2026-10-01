@@ -24,6 +24,8 @@ public:
     std::string DriverVersion();
     // The card's NVML UUID ("GPU-..."); empty when unavailable.
     std::string GpuUuid(unsigned index);
+    // Full PCI bus address, e.g. "00000000:05:00.0"; empty when unavailable.
+    std::string GpuPciBusId(unsigned index);
     std::optional<unsigned> GpuBusId(unsigned index);
     std::optional<GpuLuid> DeviceLuid(unsigned index);
     // Power limit as percent of the driver default. Empty when NVML cannot

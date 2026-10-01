@@ -100,9 +100,14 @@ std::vector<GpuInfo> enumerate_gpus(Nvml& nvml, std::string* why) {
         }
         std::string name = nvml.DeviceName(index);
         if (name.empty()) name = "NVIDIA GPU " + std::to_string(i);
-        gpus.push_back({index, uuid, std::move(name)});
+        gpus.push_back({index, uuid, std::move(name), nvml.GpuPciBusId(index)});
     }
     return gpus;
+}
+
+std::string gpu_label(const GpuInfo& gpu) {
+    return "GPU " + std::to_string(gpu.index) + " (NVML) | " + gpu.name + " | PCI " +
+           (gpu.pci_bus_id.empty() ? std::string("unknown") : gpu.pci_bus_id);
 }
 
 std::optional<GpuInfo> resolve_gpu(const std::vector<GpuInfo>& gpus, const Config& config, std::string* why) {

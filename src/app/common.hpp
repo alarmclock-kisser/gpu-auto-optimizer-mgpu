@@ -21,8 +21,10 @@ struct GpuInfo {
     unsigned index = 0;         // current NVML index; never persisted
     std::string uuid;           // stable device identity
     std::string name;
+    std::string pci_bus_id;     // full PCI address, for display and diagnostics
 };
 
+std::string gpu_label(const GpuInfo& gpu);
 bool is_elevated();
 std::string now_text();   // local time, "YYYY-MM-DD HH:MM"
 Config load_config();

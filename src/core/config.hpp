@@ -35,6 +35,7 @@ struct Config {
     std::string selected_gpu;            // NVML UUID chosen in the dashboard
 };
 
+const std::string& effective_gpu_selection(const Config& config, const std::string& session_selection);
 std::string to_json(const Config& c);
 // Never throws. Bad input yields defaults; a profile with any field missing
 // or mistyped is treated as no profile rather than half a profile.

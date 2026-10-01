@@ -105,6 +105,31 @@ static int set_offset(const char* label, int mhz, bool core) {
     return ok ? 0 : 1;
 }
 
+// --set-power <pct>: the same power knob the Manual page drives. Prints the
+// driver range, the request and the read-back, then OK/MISMATCH.
+static int set_power(int pct) {
+    gao::Nvml nvml;
+    if (!nvml.Init()) { std::printf("NVML init failed: %s\n", nvml.Error().c_str()); return 1; }
+    const auto gpu = selected_gpu(nvml);
+    if (!gpu) return 1;
+    gao::Nvapi nvapi;
+    if (!nvapi.Init()) { std::printf("NVAPI init failed: %s\n", nvapi.Error().c_str()); return 1; }
+    const auto control = selected_control(nvml, nvapi, *gpu);
+    if (!control) return 1;
+    if (!control->set_power_limit) { std::printf("power limit: not adjustable on this card\nMISMATCH\n"); return 1; }
+    const auto range =
+        control->power_limit_range_pct ? control->power_limit_range_pct() : std::pair{50, 150};
+    std::printf("power limit range: %d-%d %% of default\n", range.first, range.second);
+    const bool ok = control->set_power_limit(pct);
+    const auto applied = control->read_applied();
+    std::printf("power limit: requested %d %%, read back ", pct);
+    if (applied) std::printf("%d %%\n", applied->power_pct);
+    else std::printf("unavailable (%s)\n", nvml.Error().c_str());
+    if (!ok) std::printf("%s\n", nvml.Error().c_str());
+    std::printf("%s\n", ok ? "OK" : "MISMATCH");
+    return ok ? 0 : 1;
+}
+
 static int reset() {
     gao::Nvml nvml;
     if (!nvml.Init()) { std::printf("NVML init failed: %s\n", nvml.Error().c_str()); return 1; }
@@ -382,6 +407,11 @@ int main(int argc, char** argv) {
         if (!ParseIntArg(argv[2], &mhz)) { std::printf("--set-mem expects an integer MHz value, got '%s'\n", argv[2]); return 1; }
         return set_offset("mem offset", mhz, false);
     }
+    if (argc > 2 && std::strcmp(argv[1], "--set-power") == 0) {
+        int pct = 0;
+        if (!ParseIntArg(argv[2], &pct)) { std::printf("--set-power expects an integer percent, got '%s'\n", argv[2]); return 1; }
+        return set_power(pct);
+    }
     if (argc > 1 && std::strcmp(argv[1], "--reset") == 0) return reset();
     if (argc > 2 && std::strcmp(argv[1], "--stress") == 0) {
         int seconds = 0;
@@ -440,7 +470,7 @@ int main(int argc, char** argv) {
         }
         return optimize(preset, "", fan_curve);
     }
-    std::printf("usage: gao [--version | --probe | --set-core <mhz> | --set-mem <mhz> | --reset\n"
+    std::printf("usage: gao [--version | --probe | --set-core <mhz> | --set-mem <mhz> | --set-power <pct> | --reset\n"
                 "            | --stress <sec> [--max-temp <c>] | --bandwidth\n"
                 "            | --optimize [best|quiet|cool|max [--fan-curve silent|normal|cool|aggressive]]\n"
                 "            | --apply | --boot on|off | --fan auto | --status]\n");

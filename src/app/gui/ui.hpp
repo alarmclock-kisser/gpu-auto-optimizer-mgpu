@@ -2,6 +2,7 @@
 #include "app/gui/worker.hpp"
 #include "core/fan_curve.hpp"
 #include "core/config.hpp"
+#include "core/manual.hpp"
 #include "core/types.hpp"
 #include <deque>
 #include <functional>
@@ -11,7 +12,7 @@
 
 namespace gao::gui {
 
-enum class Page { Dashboard, Optimize, Fan, About };
+enum class Page { Dashboard, Optimize, Manual, Fan, About };
 enum class Screen { Choose, Run, Results };   // the Optimize page's state
 
 // Something the app did or was told this session, shown in the log with the
@@ -26,7 +27,7 @@ struct Note {
 struct UiState {
     Page page = Page::Dashboard;
     Screen screen = Screen::Choose;
-    Preset preset = Preset::BestOfMyGpu;
+    std::optional<Preset> preset = Preset::BestOfMyGpu;   // empty: a hand-tuned profile is active, nothing picked
     bool elevated = false;
 
     std::vector<app::GpuInfo> gpus;
@@ -56,6 +57,25 @@ struct UiState {
     int fan_max_temp_c = 75;
     FanState fan_state;
     std::optional<FanPreset> optimize_fan;   // fan curve for the next run; empty: the profile's own
+
+    // Manual tuning (the Manual page between Optimize and Fan).
+    int manual_core = 0;
+    int manual_mem = 0;
+    int manual_power = 100;
+    bool manual_use_core = true;
+    bool manual_use_mem = true;
+    bool manual_use_power = true;
+    int manual_power_min = 50;
+    int manual_power_max = 150;
+    bool manual_power_supported = false;
+    bool manual_confirmed = false;   // "I understand this may crash" for extreme values
+    Preset manual_preset = Preset::BestOfMyGpu;   // profile slot a save overwrites
+    bool manual_validated = false;
+    std::string manual_validation;   // e.g. "STABLE 60 s, 8123 it/s" or the failure reason
+    bool manual_check_running = false;
+    std::string manual_notice;       // last manual apply/save outcome
+    bool manual_notice_warn = false;
+    std::vector<std::string> manual_freezes;   // unfinished journal entries, oldest first
 };
 
 struct UiActions {
@@ -70,6 +90,9 @@ struct UiActions {
     std::function<void(const FanCurve&)> set_fan_curve;   // saves it as the active curve
     std::function<void(bool)> set_fan_control;
     std::function<void()> reset_fan_curve;                // back to the tested/default curve
+    std::function<void(const ManualTune&)> apply_manual;
+    std::function<void(Preset, const ManualTune&)> save_manual;
+    std::function<void()> validate_manual;
 };
 
 // Fonts (Segoe UI with Segoe Fluent Icons merged in) and the colour scheme.

@@ -1,5 +1,6 @@
 #pragma once
 #include "app/common.hpp"
+#include "core/stability.hpp"
 #include <atomic>
 #include <functional>
 #include <mutex>
@@ -37,6 +38,35 @@ private:
     std::optional<app::OptimizeOutcome> outcome_;
     std::atomic<bool> running_{false};
     std::atomic<bool> abort_{false};
+    std::jthread thread_;
+};
+
+// A short read-only stability check for a hand-applied tune: 60 s of the
+// same stress load the optimizer uses, at the currently applied settings.
+// Changes nothing, so stopping it early is always safe.
+class ManualWorker {
+public:
+    struct Snapshot {
+        bool running = false;
+        std::optional<StabilityResult> result;
+        std::string error;
+    };
+
+    explicit ManualWorker(std::function<void()> wake) : wake_(std::move(wake)) {}
+    ~ManualWorker();
+    ManualWorker(const ManualWorker&) = delete;
+    ManualWorker& operator=(const ManualWorker&) = delete;
+
+    bool start(std::string gpu_uuid, int max_temp_c);
+    bool running() const { return running_; }
+    Snapshot snapshot() const;
+
+private:
+    std::function<void()> wake_;
+    mutable std::mutex mu_;
+    std::optional<StabilityResult> result_;
+    std::string error_;
+    std::atomic<bool> running_{false};
     std::jthread thread_;
 };
 

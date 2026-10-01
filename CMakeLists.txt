@@ -58,6 +58,8 @@ add_library(core STATIC
   src/core/search.cpp
   src/core/boot.hpp
   src/core/boot.cpp
+  src/core/manual.hpp
+  src/core/manual.cpp
   src/core/task_xml.hpp
   src/core/task_xml.cpp
   src/core/watchdog.hpp
@@ -129,6 +131,7 @@ add_executable(core_tests
   tests/test_journal.cpp
   tests/test_search.cpp
   tests/test_boot.cpp
+  tests/test_manual.cpp
   tests/test_task_xml.cpp
   tests/test_watchdog.cpp
   tests/test_fan_curve.cpp

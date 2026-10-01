@@ -92,6 +92,9 @@ struct App {
 
     gao::gui::UiState ui;
     std::unique_ptr<gao::gui::OptimizeWorker> worker;
+    std::unique_ptr<gao::gui::ManualWorker> manual;
+    bool manual_applying = false;   // a synchronous manual apply is on the stack (see on_crash)
+    bool manual_was_running = false;
     std::unordered_map<std::string, gao::Watchdog> watchdogs;
     std::unordered_set<std::string> watched_gpus;
     bool worker_was_running = false;
@@ -139,6 +142,7 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS* ep) {
     // as long as the process; the worker's may be mid-teardown.
     if (g.gpu.set_fan_auto) g.gpu.set_fan_auto();
     if (g.worker && g.worker->running() && g.gpu.reset_to_stock) g.gpu.reset_to_stock();
+    if (g.manual_applying && g.gpu.reset_to_stock) g.gpu.reset_to_stock();
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
@@ -437,12 +441,77 @@ void refresh_status(bool with_task) {
         g.ui.profile_driver_ok = false;
         g.ui.profile_gpu_ok = false;
     }
+    // The preset cards default to the active standard profile, so the
+    // dashboard never suggests re-optimizing what is already set. A
+    // hand-tuned profile selects nothing. Only re-sync when the GPU or the
+    // saved tune changed, never stomping a pick made mid-session.
+    {
+        static std::string preset_sync_key;
+        const std::string key = active_gpu + "|" + (g.ui.profile ? g.ui.profile->saved_at : std::string("-")) + "|" +
+                                (g.ui.profile && g.ui.profile->manual ? "m" : "s");
+        if (key != preset_sync_key) {
+            preset_sync_key = key;
+            if (g.ui.profile && !g.ui.profile->manual) g.ui.preset = g.ui.profile->preset;
+            else if (!g.ui.profile) g.ui.preset = gao::Preset::BestOfMyGpu;
+            else g.ui.preset.reset();
+        }
+    }
     if (g.gpu.read_applied) g.ui.applied = g.gpu.read_applied();
     else g.ui.applied.reset();
     const auto log = gao::read_lines(gao::boot_log_path());
     g.ui.boot_log.clear();
     if (log) g.ui.boot_log.assign(log->size() > 200 ? log->end() - 200 : log->begin(), log->end());
     if (with_task) g.ui.boot_on = gao::boot_task_exists();
+    // Manual page state: the driver power range, and first-time values from
+    // the live read-back (then the saved tune, then stock).
+    {
+        if (g.gpu.power_limit_range_pct) {
+            const auto [lo, hi] = g.gpu.power_limit_range_pct();
+            if (lo < hi) {
+                g.ui.manual_power_min = lo;
+                g.ui.manual_power_max = hi;
+            } else {
+                g.ui.manual_power_min = gao::kManualPowerHardMin;
+                g.ui.manual_power_max = gao::kManualPowerHardMax;
+            }
+        } else {
+            g.ui.manual_power_min = gao::kManualPowerHardMin;
+            g.ui.manual_power_max = gao::kManualPowerHardMax;
+        }
+        g.ui.manual_power_supported = static_cast<bool>(g.gpu.set_power_limit);
+        static std::string manual_for;
+        if (manual_for != active_gpu) {
+            manual_for = active_gpu;
+            g.ui.manual_confirmed = false;
+            g.ui.manual_validated = false;
+            g.ui.manual_validation.clear();
+            g.ui.manual_notice.clear();
+            if (g.ui.applied && (g.ui.applied->core_mhz != 0 || g.ui.applied->mem_mhz != 0)) {
+                g.ui.manual_core = std::clamp(g.ui.applied->core_mhz, gao::kManualCoreMin, gao::kManualCoreMax);
+                g.ui.manual_mem = std::clamp(g.ui.applied->mem_mhz, gao::kManualMemMin, gao::kManualMemMax);
+                g.ui.manual_power = std::clamp(g.ui.applied->power_pct, g.ui.manual_power_min, g.ui.manual_power_max);
+            } else if (g.ui.profile) {
+                g.ui.manual_core = std::clamp(g.ui.profile->core_mhz, gao::kManualCoreMin, gao::kManualCoreMax);
+                g.ui.manual_mem = std::clamp(g.ui.profile->mem_mhz, gao::kManualMemMin, gao::kManualMemMax);
+                g.ui.manual_power = std::clamp(g.ui.profile->power_pct, g.ui.manual_power_min, g.ui.manual_power_max);
+                g.ui.manual_preset = g.ui.profile->preset;
+            } else {
+                g.ui.manual_core = 0;
+                g.ui.manual_mem = 0;
+                g.ui.manual_power = 100;
+            }
+            g.ui.manual_use_core = true;
+            g.ui.manual_use_mem = true;
+            g.ui.manual_use_power = true;
+        }
+        g.ui.manual_power = std::clamp(g.ui.manual_power, g.ui.manual_power_min, g.ui.manual_power_max);
+        const auto jlines = gao::read_lines(gao::journal_path());
+        g.ui.manual_freezes.clear();
+        if (jlines) {
+            const gao::Journal journal(*jlines, [](const std::string&) { return true; });
+            g.ui.manual_freezes = journal.freezes();
+        }
+    }
     fan_sync(cfg);
 }
 
@@ -453,6 +522,10 @@ void hw_lost();   // below, with the other hardware helpers
 void act_optimize(gao::Preset preset) {
     if (g.selected_gpu.empty() || !g.selected_gpu_bound) {
         note(g.selected_gpu_error.empty() ? "Select an available NVIDIA GPU first." : g.selected_gpu_error, true);
+        return;
+    }
+    if (g.manual && g.manual->running()) {
+        note("A 60 s manual validation is running; wait for it to finish.", true);
         return;
     }
     fan_release(g.selected_gpu);   // the search drives this GPU's fans itself
@@ -564,6 +637,81 @@ void act_boot(bool on) {
     refresh_status(true);
 }
 
+void act_apply_manual(const gao::ManualTune& tune) {
+    if (refuse_while_tuning()) return;
+    if (g.manual && g.manual->running()) {
+        note("A 60 s validation is running; wait for it to finish.", true);
+        return;
+    }
+    if (g.selected_gpu.empty() || !g.selected_gpu_bound) {
+        note(g.selected_gpu_error.empty() ? "Select an available NVIDIA GPU first." : g.selected_gpu_error, true);
+        return;
+    }
+    struct Guard {
+        bool& flag;
+        explicit Guard(bool& f) : flag(f) { flag = true; }
+        ~Guard() { flag = false; }
+    } guard(g.manual_applying);   // the crash handler resets to stock while this is set
+    const gao::ManualTune snapped = gao::manual_snap(tune);
+    const auto out = gao::app::apply_manual_tune(g.selected_gpu, snapped);
+    g.ui.manual_notice = out.ok ? out.message : "Not applied: " + out.message;
+    g.ui.manual_notice_warn = !out.ok;
+    note(g.ui.manual_notice, !out.ok);
+    if (out.ok) {
+        // A hand-applied tune is watched like a saved one from now on.
+        g.watched_gpus.insert(g.selected_gpu);
+        g.watchdogs[g.selected_gpu] = gao::Watchdog();
+        g.ui.manual_validated = false;
+        g.ui.manual_validation.clear();
+    }
+    refresh_status(false);
+    if (out.ok) {
+        // refresh_status re-seeds a new GPU only; keep the just-applied values.
+        g.ui.manual_core = snapped.core_mhz;
+        g.ui.manual_mem = snapped.mem_mhz;
+        g.ui.manual_power = std::clamp(snapped.power_pct, g.ui.manual_power_min, g.ui.manual_power_max);
+        g.ui.manual_use_core = snapped.use_core;
+        g.ui.manual_use_mem = snapped.use_mem;
+        g.ui.manual_use_power = snapped.use_power;
+        g.ui.manual_notice = out.message;
+        g.ui.manual_notice_warn = false;
+    }
+}
+
+void act_save_manual(gao::Preset preset, const gao::ManualTune& tune) {
+    if (refuse_while_tuning()) return;
+    if (g.selected_gpu.empty()) {
+        note("Select an available NVIDIA GPU first.", true);
+        return;
+    }
+    std::string message;
+    const bool ok = gao::app::save_manual_profile(g.selected_gpu, preset, tune, g.ui.manual_validated,
+                                                  g.ui.manual_validation, &message);
+    g.ui.manual_notice = ok ? message : "Not saved: " + message;
+    g.ui.manual_notice_warn = !ok;
+    note(g.ui.manual_notice, !ok);
+    refresh_status(false);
+}
+
+void act_validate_manual() {
+    if (refuse_while_tuning()) return;
+    if (!g.manual) return;
+    if (g.manual->running()) return;
+    if (g.selected_gpu.empty() || !g.selected_gpu_bound) {
+        note(g.selected_gpu_error.empty() ? "Select an available NVIDIA GPU first." : g.selected_gpu_error, true);
+        return;
+    }
+    const gao::Config cfg = gao::app::load_config();
+    const gao::DeviceSettings* device = gao::find_device(cfg, g.selected_gpu);
+    const int max_temp = device && device->profile ? gao::objectives_for(device->profile->preset).max_temp_c : 83;
+    g.ui.manual_check_running = true;
+    g.ui.manual_validation = "Validating: 60 s of compute load at the applied settings...";
+    if (!g.manual->start(g.selected_gpu, max_temp)) {
+        g.ui.manual_check_running = false;
+        g.ui.manual_validation = "A validation is already running.";
+    }
+}
+
 void render() {
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
@@ -598,6 +746,9 @@ void render() {
         if (!gao::app::save_config(cfg)) note("Could not save the fan curve.", true);
         refresh_status(false);
     };
+    act.apply_manual = act_apply_manual;
+    act.save_manual = act_save_manual;
+    act.validate_manual = act_validate_manual;
     act.detect_gpu = [] {   // e.g. after a driver update: re-create NVML and NVAPI now
         if (refuse_while_tuning()) return;
         hw_lost();
@@ -738,11 +889,37 @@ void on_telemetry() {
         refresh_status(false);
     }
     g.worker_was_running = running;
+    // A finished manual validation: record it on the Manual page. It changed
+    // nothing, so the watchdog set is untouched.
+    if (g.manual) {
+        const auto snap = g.manual->snapshot();
+        g.ui.manual_check_running = snap.running;
+        if (g.manual_was_running && !snap.running) {
+            if (!snap.error.empty()) {
+                g.ui.manual_validated = false;
+                g.ui.manual_validation = "Validation failed to run: " + snap.error;
+                note(g.ui.manual_validation, true);
+            } else if (snap.result) {
+                const char* verdict = gao::verdict_name(snap.result->verdict);
+                char buf[128];
+                std::snprintf(buf, sizeof(buf), "%s 60 s, %.0f it/s, peak %d C", verdict, snap.result->score,
+                              snap.result->peak_temp_c);
+                g.ui.manual_validation = buf;
+                g.ui.manual_validated = snap.result->verdict == gao::Verdict::Stable;
+                note(std::string("Manual validation: ") + buf, !g.ui.manual_validated);
+            }
+            refresh_status(false);
+            g.ui.manual_check_running = false;
+        }
+        g.manual_was_running = snap.running;
+    }
 }
 
 void on_watchdog() {
-    // Never under a running search -- ours, or gao --optimize in a shell.
+    // Never under a running search -- ours, or gao --optimize in a shell --
+    // and never during a manual 60 s validation, which measures the clocks.
     if (g.watched_gpus.empty() || g.worker->running() || gao::app::tuning_in_progress()) return;
+    if (g.manual && g.manual->running()) return;
     if (!g.ui.elevated || !g.nvml_ok || !g.nvapi_ok) return;
     const gao::Config cfg = gao::app::load_config();
     const std::string driver = g.nvml->DriverVersion();
@@ -1023,6 +1200,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
     ImGui_ImplDX11_Init(g.device.Get(), g.ctx.Get());
 
     g.worker = std::make_unique<gao::gui::OptimizeWorker>([] { PostMessageW(g.hwnd, WM_APP_WAKE, 0, 0); });
+    g.manual = std::make_unique<gao::gui::ManualWorker>([] { PostMessageW(g.hwnd, WM_APP_WAKE, 0, 0); });
     init_hw();
 
     tray_icon(NIM_ADD);

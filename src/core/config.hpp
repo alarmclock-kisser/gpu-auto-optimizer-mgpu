@@ -16,6 +16,7 @@ struct Profile {
     std::string gpu;        // NVML UUID of the card it was tested on
     std::string saved_at;   // local time, "YYYY-MM-DD HH:MM"
     std::optional<FanCurve> fan_curve;   // the curve the tune was tested with; nullopt: tuned before fan control
+    bool manual = false;    // hand-tuned on the Manual page, not from --optimize; the dashboard selects no preset for it
 };
 
 // Settings that belong to one physical GPU, keyed by its stable NVML UUID.

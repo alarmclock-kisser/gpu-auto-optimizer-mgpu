@@ -5,6 +5,7 @@
 #include "core/boot.hpp"
 #include "core/config.hpp"
 #include "core/fan_curve.hpp"
+#include "core/manual.hpp"
 #include "core/objectives.hpp"
 #include "core/search.hpp"
 #include "core/types.hpp"
@@ -92,12 +93,35 @@ struct BootApplyOutcome {
     std::vector<std::string> applied_gpus;
     std::vector<std::string> strike_gpus;
     std::string message;       // what happened, as written to boot.log
+    bool unclean_reset = false;   // an unfinished journal entry forced a reset to stock first
 };
 
 // The logon half of boot-apply, independently for every saved GPU profile.
-BootApplyOutcome apply_at_logon();
+// When the crash journal holds an unfinished entry (a freeze or a killed
+// process between begin and complete), every reachable GPU is reset to stock
+// first and nothing is applied this boot: unclean_reset is true and the
+// freeze becomes a ceiling for the next run.
 // After the grace period: clears only the strikes recorded for this logon.
+BootApplyOutcome apply_at_logon();
 void clear_boot_strikes(const std::vector<std::string>& gpu_uuids);
+
+// Manual tuning through the same guards as --optimize: elevation, the tuning
+// lock, the admin-only state folder, the crash journal and verified writes.
+// Any failure ends at stock.
+struct ManualApplyOutcome {
+    bool ok = false;
+    std::string message;
+    std::optional<AppliedState> readback;
+};
+
+ManualApplyOutcome apply_manual_tune(const std::string& gpu_uuid, const ManualTune& tune);
+// Saves a hand-tuned value set as the GPU's profile (one profile per GPU).
+// validated=false saves anyway with a warning; the caller shows the badge.
+bool save_manual_profile(const std::string& gpu_uuid, Preset preset, const ManualTune& tune, bool validated,
+                         const std::string& validation_note, std::string* message);
+// Driver power range for the Manual page ({min, max} percent of default);
+// {50, 150} when the card reports none.
+std::pair<int, int> manual_power_range(const std::string& gpu_uuid);
 
 // Installs the exes into Program Files and registers the logon task (true),
 // or removes both. `message` describes the outcome either way.

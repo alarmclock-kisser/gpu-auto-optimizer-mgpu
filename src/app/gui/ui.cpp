@@ -41,6 +41,7 @@ enum Icon : unsigned {
     kIconTemp = 0xE9CA, kIconPower = 0xE945, kIconFan = 0xF16A, kIconRefresh = 0xE72C, kIconUndo = 0xE777,
     kIconPlay = 0xF5B0, kIconStop = 0xE71A, kIconClock = 0xE823, kIconStar = 0xE734, kIconQuiet = 0xE992,
     kIconLeaf = 0xEC0A, kIconGauge = 0xEC4A, kIconShield = 0xEA18, kIconList = 0xE8FD, kIconBack = 0xE72B,
+    kIconSliders = 0xE9E9,
 };
 
 // UTF-8 for a code point in the Basic Multilingual Plane's private use area.
@@ -355,9 +356,18 @@ void tuning_card(const UiState& s, const UiActions& act) {
 void profiles_card(UiState& s) {
     begin_card("profiles");
     heading("Optimization profiles");
+    // The shortcut is pointless when the picked preset is already the valid
+    // active tune: optimizing it again would only reproduce it. (A full
+    // re-run stays available on the Optimize page.) A stale tune (driver or
+    // card changed) or a different pick keeps the shortcut enabled.
+    const bool active_match = s.preset && s.profile && !s.profile->manual && *s.preset == s.profile->preset &&
+                              s.profile_driver_ok && s.profile_gpu_ok;
     const std::string go = with_icon(kIconPulse, "Optimize...");
     align_right(button_width(go));
+    ImGui::BeginDisabled(active_match);
     if (ImGui::Button(go.c_str())) s.page = Page::Optimize;
+    ImGui::EndDisabled();
+    if (active_match) dim("This profile is already the active tune.");
     ImGui::Spacing();
     preset_cards(s);
     end_card();
@@ -415,6 +425,263 @@ void log_card(const UiState& s) {
         }
         ImGui::EndTable();
     }
+    end_card();
+}
+
+// ------------------------------------------------------------------ manual
+
+const ImVec4& zone_color(ManualZone zone) {
+    if (zone == ManualZone::Extreme) return kBad;
+    if (zone == ManualZone::Warm) return kWarn;
+    return kGood;
+}
+
+const char* zone_name(ManualZone zone) {
+    if (zone == ManualZone::Extreme) return "EXTREME";
+    if (zone == ManualZone::Warm) return "warm";
+    return "safe";
+}
+
+ManualTune manual_tune_of(const UiState& s) {
+    ManualTune t;
+    t.use_core = s.manual_use_core;
+    t.use_mem = s.manual_use_mem;
+    t.use_power = s.manual_use_power;
+    t.core_mhz = s.manual_core;
+    t.mem_mhz = s.manual_mem;
+    t.power_pct = s.manual_power;
+    return manual_snap(t);
+}
+
+// One knob: enable checkbox, slider, numeric input and the zone badge. The
+// value text (and the badge) is green/amber/red by zone, so extreme values
+// are visible before anything is applied.
+void manual_knob(const char* id, const char* label, const char* unit, int* value, int min_v, int max_v, bool* use,
+                 bool enabled, ManualZone zone, bool dimmed) {
+    ImGui::PushID(id);
+    ImGui::BeginDisabled(!enabled || (use && !*use && false));
+    ImGui::Checkbox("##use", use);
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine(0, em());
+    const float badge_w = em() * 9;
+    ImGui::SetNextItemWidth(std::max(em() * 8, ImGui::GetContentRegionAvail().x - badge_w - em() * 12));
+    ImGui::BeginDisabled(!enabled || !*use);
+    if (ImGui::SliderInt("##slider", value, min_v, max_v)) {
+        // Live while dragging; snapped on release below.
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        ManualTune one;
+        one.core_mhz = *value;
+        one.mem_mhz = *value;
+        one.power_pct = *value;
+        const ManualTune snapped = manual_snap(one);
+        // manual_snap clamps to the hard bounds; re-clamp to this knob's own
+        // driver range so the power slider cannot leave it.
+        *value = std::clamp(unit[0] == '%' ? snapped.power_pct : snapped.core_mhz, min_v, max_v);
+        if (unit[0] == 'M') {
+            // Core and memory share manual_snap(); pick the right field back.
+            *value = std::clamp(*value, min_v, max_v);
+        }
+    }
+    ImGui::SameLine(0, em() * 0.5f);
+    ImGui::SetNextItemWidth(em() * 7);
+    ImGui::InputInt("##num", value, 0, 0);
+    *value = std::clamp(*value, min_v, max_v);
+    ImGui::EndDisabled();
+    ImGui::SameLine(0, em() * 0.5f);
+    const ImVec4& col = dimmed ? kDim : zone_color(zone);
+    ImGui::PushStyleColor(ImGuiCol_Text, col);
+    ImGui::TextUnformatted((std::string(unit) + "  " + zone_name(zone)).c_str());
+    ImGui::PopStyleColor();
+    ImGui::EndDisabled();
+    ImGui::PopID();
+}
+
+void manual_page(UiState& s, const UiActions& act) {
+    static bool confirm_open = false;
+    static ManualTune pending{};
+    const ManualTune tune = manual_tune_of(s);
+    const bool power_ok = s.manual_power_supported;
+    const int pmin = std::min(s.manual_power_min, s.manual_power_max);
+    const int pmax = std::max(s.manual_power_min, s.manual_power_max);
+    const ManualZone zc = core_zone(manual_effective_core(tune));
+    const ManualZone zm = mem_zone(manual_effective_mem(tune));
+    const ManualZone zp = power_zone(manual_effective_power(tune), pmin, pmax);
+    const bool extreme = manual_is_extreme(tune, pmin, pmax);
+    const bool can_write = s.elevated && s.telemetry_ready;
+    const bool busy = s.manual_check_running;
+
+    begin_card("manual");
+    heading("Manual tuning");
+    dim("Every knob the Optimize runner tests and changes. Nothing is hidden: values outside the search bounds are refused, "
+        "every write is read back, and a failed apply ends at stock.");
+    ImGui::Spacing();
+    if (!s.elevated) wrapped(kWarn, "Read-only: restart as administrator from the dashboard to change anything.");
+    if (!s.telemetry_ready) wrapped(kDim, "Waiting for telemetry for the selected GPU.");
+    if (s.applied) {
+        const AppliedState& a = *s.applied;
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "Applied now: power %d %%, core %s, memory %s.", a.power_pct,
+                      offset(a.core_mhz).c_str(), offset(a.mem_mhz).c_str());
+        wrapped(kText, buf);
+    }
+    if (s.profile) {
+        const Profile& p = *s.profile;
+        wrapped(kDim, "Saved tune: " + std::string(title_of(p.preset)) + ": " + std::to_string(p.power_pct) +
+                          " %, core " + offset(p.core_mhz) + ", memory " + offset(p.mem_mhz) + " (" + p.saved_at + ")");
+    } else {
+        wrapped(kDim, "Saved tune: none yet for this GPU.");
+    }
+    char range[96];
+    std::snprintf(range, sizeof(range),
+                  "Driver power range: %d-%d %% of default, step %d %%. Core %d to %d MHz, step %d MHz. "
+                  "Memory %d to %d MHz, step %d MHz. Negative is a downclock, not undervolting.",
+                  pmin, pmax, kManualPowerStep, kManualCoreMin, kManualCoreMax, kManualCoreStep, kManualMemMin,
+                  kManualMemMax, kManualMemStep);
+    wrapped(kDim, range);
+    if (!power_ok) wrapped(kWarn, "Power limit: not adjustable on this card. The power knob stays at 100 %.");
+    ImGui::Spacing();
+
+    manual_knob("core", "Core clock offset", "MHz", &s.manual_core, kManualCoreMin, kManualCoreMax, &s.manual_use_core,
+                can_write && !busy, zc, !s.manual_use_core);
+    manual_knob("mem", "Memory clock offset", "MHz", &s.manual_mem, kManualMemMin, kManualMemMax, &s.manual_use_mem,
+                can_write && !busy, zm, !s.manual_use_mem);
+    if (power_ok) {
+        manual_knob("power", "Power limit", "%", &s.manual_power, pmin, pmax, &s.manual_use_power, can_write && !busy,
+                    zp, !s.manual_use_power);
+    } else {
+        dim("Power limit: the driver exposes no adjustable range on this card.");
+    }
+    // Keep the state on the hardware steps after any edit.
+    {
+        const ManualTune snapped = manual_snap(tune);
+        s.manual_core = snapped.core_mhz;
+        s.manual_mem = snapped.mem_mhz;
+        s.manual_power = std::clamp(snapped.power_pct, pmin, pmax);
+    }
+    ImGui::Spacing();
+
+    if (extreme) {
+        wrapped(kBad, "EXTREME values (red) push the card to the edge of the tested range. They may freeze the machine. "
+                      "The crash journal records them first, so a freeze is never retried, and the next boot resets to "
+                      "stock instead of re-applying.");
+        bool confirm = s.manual_confirmed;
+        if (ImGui::Checkbox("I understand this may crash the PC, and the next boot will reset to stock", &confirm)) {
+            s.manual_confirmed = confirm;
+            s.manual_validated = false;
+            s.manual_validation.clear();
+        }
+    }
+    if (!s.manual_notice.empty()) wrapped(s.manual_notice_warn ? kWarn : kGood, s.manual_notice);
+    const float bw = std::max(em() * 12, ImGui::GetContentRegionAvail().x / 3 - em());
+    const float bh = em() * 2.3f;
+    ImGui::BeginDisabled(!can_write || busy || (extreme && !s.manual_confirmed));
+    const std::string apply_label = extreme ? "Apply EXTREME values..." : "Apply manual values";
+    if (primary_button(apply_label, ImVec2(bw, bh))) {
+        if (extreme) {
+            pending = manual_tune_of(s);
+            confirm_open = true;
+            ImGui::OpenPopup("Confirm extreme");
+        } else if (act.apply_manual) {
+            act.apply_manual(manual_tune_of(s));
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine(0, em());
+    ImGui::BeginDisabled(!can_write || busy);
+    if (ImGui::Button(with_icon(kIconUndo, "Revert to stock").c_str(), ImVec2(bw, bh))) act.revert_to_stock();
+    ImGui::EndDisabled();
+    ImGui::SameLine(0, em());
+    ImGui::BeginDisabled(!can_write || busy);
+    if (ImGui::Button(with_icon(kIconPlay, s.manual_check_running ? "Validating..." : "Validate 60 s").c_str(),
+                      ImVec2(bw, bh))) {
+        if (act.validate_manual) act.validate_manual();
+    }
+    ImGui::EndDisabled();
+    if (ImGui::BeginPopupModal("Confirm extreme", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        wrapped(kBad, "Apply power " + std::to_string(manual_effective_power(pending)) + " %, core +" +
+                          std::to_string(manual_effective_core(pending)) + " MHz, memory +" +
+                          std::to_string(manual_effective_mem(pending)) + " MHz?");
+        wrapped(kText, "A freeze becomes a ceiling: the next run stays below it, and the next boot resets to stock. "
+                       "Apply anyway?");
+        if (primary_button("Apply anyway", ImVec2(em() * 12, 0))) {
+            ImGui::CloseCurrentPopup();
+            confirm_open = false;
+            if (act.apply_manual) act.apply_manual(pending);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            ImGui::CloseCurrentPopup();
+            confirm_open = false;
+        }
+        ImGui::EndPopup();
+    }
+    (void)confirm_open;
+    ImGui::Spacing();
+
+    begin_card("save", 0, kInner);
+    heading("Save as profile");
+    dim("One profile per GPU. Saving overwrites the chosen slot with these values and the current driver version.");
+    const char* slot_names[] = {"Best of my GPU", "Cool & efficient", "Quiet", "Max performance"};
+    int slot = s.manual_preset == Preset::CoolAndEfficient     ? 1
+               : s.manual_preset == Preset::Quiet              ? 2
+               : s.manual_preset == Preset::MaxPerformance     ? 3
+                                                               : 0;
+    ImGui::SetNextItemWidth(em() * 14);
+    if (ImGui::Combo("##slot", &slot, slot_names, 4)) {
+        s.manual_preset = slot == 1 ? Preset::CoolAndEfficient : slot == 2 ? Preset::Quiet
+                          : slot == 3                                       ? Preset::MaxPerformance
+                                                                            : Preset::BestOfMyGpu;
+        s.manual_validated = false;
+        s.manual_validation.clear();
+    }
+    ImGui::SameLine(0, em());
+    ImGui::BeginDisabled(!s.elevated || busy);
+    if (primary_button("Save profile")) {
+        if (act.save_manual) act.save_manual(s.manual_preset, manual_tune_of(s));
+    }
+    ImGui::EndDisabled();
+    if (s.manual_validated && !s.manual_validation.empty()) wrapped(kGood, "Validated: " + s.manual_validation);
+    else if (!s.manual_validation.empty()) wrapped(kWarn, s.manual_validation);
+    else wrapped(kWarn, "Not validated: no 60 s check has passed for these values yet. Saving is allowed, but apply-at-logon "
+                       "treats unvalidated manual tunes like any other tune.");
+    end_card();
+
+    ImGui::Spacing();
+    begin_card("safety", 0, kInner);
+    heading("Protection fallback");
+    wrapped(kText, "Before a value touches the hardware, a begin line is flushed to the crash journal. A freeze leaves an "
+                   "unmatched begin behind: the next run stays below it (one step back), and the next logon resets every "
+                   "GPU to stock first and applies nothing that boot.");
+    if (!s.manual_freezes.empty()) {
+        std::string f;
+        for (const auto& e : s.manual_freezes) f += (f.empty() ? "" : ", ") + e;
+        wrapped(kWarn, "Unfinished journal entries: " + f + ". The next logon resets to stock.");
+    } else {
+        wrapped(kGood, "Crash journal: clean, no unfinished entries.");
+    }
+    if (s.strikes > 0) {
+        wrapped(kWarn, "Boot strikes: " + std::to_string(s.strikes) + " of " + std::to_string(kMaxBootStrikes) +
+                           ". Apply at logon stops at " + std::to_string(kMaxBootStrikes) + ".");
+    }
+    wrapped(kDim, "Earliest enforcement is the logon task (no service/driver in this tool): it runs at every logon with no "
+                  "delay and resets before applying. A failed write is verified by read-back and ends at stock; three "
+                  "crashing logons in a row switch apply-at-logon off.");
+    end_card();
+
+    ImGui::Spacing();
+    begin_card("limits", 0, kInner);
+    heading("What is (and is not) adjustable");
+    wrapped(kText, "Adjustable here: power limit, core offset, memory offset -- exactly what the Optimize runner tests. "
+                   "Fan curves live on the Fan page.");
+    wrapped(kWarn, "Not writable and shown read-only on the dashboard: voltage points, per-P-state clocks and multipliers. "
+                   "The public NVML/NVAPI path exposes no safe handle for them, and locking a voltage point hard-froze the "
+                   "reference card, so this tool does not touch the voltage curve. Nothing is hidden: if the driver reports "
+                   "a value, the dashboard shows it; if it cannot be set safely, there is no knob for it. "
+                   "CLI mirrors: gao --set-core / --set-mem / --set-power, gao --reset, gao --stress, gao --status.");
+    end_card();
     end_card();
 }
 
@@ -678,10 +945,19 @@ void choose(UiState& s, const UiActions& act) {
     ImGui::Spacing();
     const ImVec2 big(em() * 13, em() * 2.6f);
     ImGui::PushFont(g_bold, base() * 1.15f);
-    const bool go = s.elevated ? primary_button(with_icon(kIconPlay, "Optimize GPU"), big)
-                               : primary_button("Restart as administrator", big);
+    bool go = false;
+    if (s.elevated) {
+        // No pick, no run: with a hand-tuned profile active nothing is
+        // pre-selected, so optimizing the stale default would surprise.
+        ImGui::BeginDisabled(!s.preset.has_value());
+        go = primary_button(with_icon(kIconPlay, "Optimize GPU"), big);
+        ImGui::EndDisabled();
+    } else {
+        go = primary_button("Restart as administrator", big);
+    }
     ImGui::PopFont();
-    if (go) s.elevated ? act.optimize(s.preset) : act.restart_elevated();
+    if (go) s.elevated ? act.optimize(*s.preset) : act.restart_elevated();
+    if (s.elevated && !s.preset) dim("Pick a profile first: a hand-tuned profile is active.");
     ImGui::SameLine(0, em() * 1.5f);
     ImGui::BeginGroup();
     ImGui::TextUnformatted((ic(kIconClock) + "  About 10 minutes of full GPU load.").c_str());
@@ -692,7 +968,7 @@ void choose(UiState& s, const UiActions& act) {
 
 void run_screen(UiState& s, const OptimizeWorker::Snapshot& run, const UiActions& act) {
     begin_card("run");
-    text_bold((std::string("Optimizing: ") + title_of(s.preset)).c_str(), 1.4f);
+    text_bold((std::string("Optimizing: ") + title_of(s.preset.value_or(Preset::BestOfMyGpu))).c_str(), 1.4f);
     if (run.running) {
         const std::string abort = with_icon(kIconStop, "Abort");
         align_right(button_width(abort) + em());
@@ -834,6 +1110,7 @@ void sidebar(UiState& s) {
     ImGui::PopStyleColor();
     nav_item(s, Page::Dashboard, kIconHome, "Dashboard");
     nav_item(s, Page::Optimize, kIconPulse, "Optimize");
+    nav_item(s, Page::Manual, kIconSliders, "Manual");
     nav_item(s, Page::Fan, kIconFan, "Fan");
     nav_item(s, Page::About, kIconInfo, "About");
     ImGui::SetCursorPosY(ImGui::GetWindowHeight() - em() * 2.2f);
@@ -928,6 +1205,7 @@ void draw_ui(UiState& s, const OptimizeWorker::Snapshot& run, const UiActions& a
     switch (s.page) {
         case Page::Dashboard: dashboard(s, act); break;
         case Page::Optimize: optimize_page(s, run, act); break;
+        case Page::Manual: manual_page(s, act); break;
         case Page::Fan: fan_page(s, act); break;
         case Page::About: about(); break;
     }

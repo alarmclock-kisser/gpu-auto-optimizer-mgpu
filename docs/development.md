@@ -60,6 +60,7 @@ src/core/     pure logic: no windows.h, no driver calls, no D3D. Unit-tested in 
   stress_math.*   exact-float stress inputs and the CPU reference result
   stability.*     the stress run loop and its verdict
   journal.*       write-ahead log of clock candidates; a freeze becomes a ceiling
+  manual.*        hand-applied power/core/memory: same bounds, extreme zones, journaled apply
   search.*        the tuner: baseline, power, core, memory, confirmation, soak
   boot.*          when a logon apply may run (strikes, driver, card) and the verified apply
   watchdog.*      the tray app's decisions: re-apply, give up, back off, driver changed

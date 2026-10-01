@@ -1,4 +1,5 @@
 #include "core/boot.hpp"
+#include "core/manual.hpp"
 #include "core/search.hpp"
 
 namespace gao {
@@ -12,8 +13,10 @@ BootDecision decide_boot(const DeviceSettings& device, const std::string& driver
 }
 
 bool apply_profile(const GpuControl& gpu, const Profile& p, std::string* why) {
-    if (p.power_pct < 50 || p.power_pct > 150 || p.core_mhz < 0 || p.core_mhz > kCoreMaxMhz ||
-        p.mem_mhz < 0 || p.mem_mhz > kMemMaxMhz) {
+    // Up: never more than the search could have produced. Down: a modest
+    // downclock from a hand-tuned profile (downclocking, not undervolting).
+    if (p.power_pct < 50 || p.power_pct > 150 || p.core_mhz < kManualCoreMin || p.core_mhz > kCoreMaxMhz ||
+        p.mem_mhz < kManualMemMin || p.mem_mhz > kMemMaxMhz) {
         if (why) *why = "profile values out of range; nothing applied";
         return false;
     }

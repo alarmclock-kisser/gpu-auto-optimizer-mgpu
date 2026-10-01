@@ -146,6 +146,20 @@ TEST_CASE("a mismatched profile UUID cannot be attached to another device") {
     CHECK_FALSE(find_profile(c, "GPU-1"));
 }
 
+TEST_CASE("a hand-tuned profile survives a round-trip; older files read as optimizer results") {
+    Config c;
+    DeviceSettings& device = ensure_device(c, "GPU-8a1b");
+    device.profile = sample();
+    device.profile->manual = true;
+    const Config back = from_json(to_json(c));
+    REQUIRE(find_profile(back, "GPU-8a1b"));
+    CHECK(find_profile(back, "GPU-8a1b")->manual);
+    const Config older = from_json(R"({"devices":[{"gpu":"GPU-1","profile":{"preset":"best","power_pct":105,
+        "core_mhz":135,"mem_mhz":1050,"driver":"x","gpu":"GPU-1","saved_at":"y"}}]})");
+    REQUIRE(find_profile(older, "GPU-1"));
+    CHECK_FALSE(find_profile(older, "GPU-1")->manual);
+}
+
 TEST_CASE("an invalid fan curve reads as absent without losing the profile") {
     Config c;
     DeviceSettings& device = ensure_device(c, "GPU-8a1b");

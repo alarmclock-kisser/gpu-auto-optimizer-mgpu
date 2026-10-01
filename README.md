@@ -95,6 +95,7 @@ flowchart LR
 | `gao --optimize best\|quiet\|cool\|max [--fan-curve silent\|normal\|cool\|aggressive]` | Runs the search; exit code 0 when saved, 2 when applied but not saved |
 | `gao --apply` | Re-applies the selected GPU's saved profile |
 | `gao --reset` | Returns the selected GPU to stock clocks and the default power limit |
+| `gao --set-core <mhz>` / `--set-mem <mhz>` / `--set-power <pct>` | Sets one knob directly with read-back (same bounds as the Manual page) |
 | `gao --boot on\|off` | Turns apply-at-logon on or off |
 | `gao --fan auto` | Hands every fan back to the NVIDIA driver, whatever set it (a running tray app takes them again on its next tick; switch Fan control off to keep the driver in charge) |
 | `gao --status` | Saved profiles for all GPUs, the selected GPU's current settings, apply-at-logon state |
@@ -127,7 +128,7 @@ The saved profile is tied to the driver version it was tuned on. After an update
 <details>
 <summary><b>What if a setting crashes my PC?</b></summary>
 
-During a search, the crash journal makes sure that setting is never tried again, and the next run stays below it. At logon, three crashes in a row within two minutes of applying switch apply-at-logon off.
+During a search, the crash journal makes sure that setting is never tried again, and the next run stays below it. The Manual page uses the same journal for hand-applied values: extreme values need an explicit confirmation, and an unfinished entry resets every GPU to stock at the next logon instead of re-applying. At logon, three crashes in a row within two minutes of applying switch apply-at-logon off.
 </details>
 
 <details>
@@ -139,7 +140,7 @@ Yes. Each profile comes with a fan curve, and you can pick another (Silent, Norm
 <details>
 <summary><b>Does it undervolt?</b></summary>
 
-No. Locking a voltage point froze the reference card during development, so no profile touches the voltage curve.
+No. Locking a voltage point froze the reference card during development, so no profile touches the voltage curve. The Manual page explains this instead of hiding it: voltage points and per-P-state multipliers are read-only telemetry, with no knob.
 </details>
 
 <details>

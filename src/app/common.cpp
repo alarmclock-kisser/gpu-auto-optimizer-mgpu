@@ -301,6 +301,43 @@ BootApplyOutcome apply_at_logon() {
         record(list_why);
         return out;
     }
+    // Protection fallback: an unfinished journal entry means the last run --
+    // optimize or manual -- froze or was killed between begin and complete.
+    // Reset every reachable GPU to stock as early as possible and apply
+    // nothing this boot. The freeze stays a ceiling, so the next run tests
+    // one step below it instead of crashing again.
+    const auto jpath = journal_path();
+    const auto jlines = jpath.empty() ? std::optional<std::vector<std::string>>{}
+                                      : read_lines(jpath);
+    if (!jlines) {
+        record("crash journal unreadable; nothing applied without it");
+        return out;
+    }
+    const Journal journal(*jlines, [](const std::string&) { return true; });
+    if (!journal.freezes().empty()) {
+        out.unclean_reset = true;
+        std::string frozen;
+        for (const auto& f : journal.freezes()) frozen += (frozen.empty() ? "" : ", ") + f;
+        Nvapi reset_api;
+        if (!reset_api.Init()) {
+            record("unclean shutdown at " + frozen + "; NVAPI init failed (" + reset_api.Error() +
+                   "), nothing applied");
+            return out;
+        }
+        for (const GpuInfo& info : gpus) {
+            std::string why;
+            const auto control = make_gpu_control(nvml, reset_api, info.index, &why);
+            if (!control) {
+                record("GPU " + info.uuid + " could not be reset to stock: " + why);
+                continue;
+            }
+            const bool ok = control->reset_to_stock && control->reset_to_stock();
+            record("GPU " + info.uuid + (ok ? " reset to stock after an unclean shutdown at " + frozen
+                                            : " reset to stock FAILED after an unclean shutdown; run `gao --reset`"));
+        }
+        record("nothing applied this boot; the next run stays below " + frozen);
+        return out;
+    }
     Nvapi nvapi;
     bool nvapi_ready = false;
     for (DeviceSettings& device : cfg.devices) {
@@ -411,6 +448,127 @@ bool disable_boot(std::string* message) {
     return say(std::string("boot-apply off: task ") + (code == 0 ? "removed" : "not removed") + ", installed copy " +
                    (removed_now ? "removed" : "in use by the running tray app; it is removed at the next restart"),
                code == 0);
+}
+
+std::pair<int, int> manual_power_range(const std::string& gpu_uuid) {
+    Nvml nvml;
+    if (!nvml.Init()) return {kManualPowerHardMin, kManualPowerHardMax};
+    const auto gpus = enumerate_gpus(nvml, nullptr);
+    const auto it = std::find_if(gpus.begin(), gpus.end(),
+                                 [&](const GpuInfo& gpu) { return gpu.uuid == gpu_uuid; });
+    if (it == gpus.end()) return {kManualPowerHardMin, kManualPowerHardMax};
+    const auto range = nvml.PowerLimitRangePct(it->index);
+    if (!range || range->first >= range->second) return {kManualPowerHardMin, kManualPowerHardMax};
+    return *range;
+}
+
+ManualApplyOutcome apply_manual_tune(const std::string& gpu_uuid, const ManualTune& tune) {
+    ManualApplyOutcome out;
+    if (!is_elevated()) {
+        out.message = "manual apply changes clocks and power limits and needs administrator rights";
+        return out;
+    }
+    const TuningLock lock;
+    if (!lock.owned()) {
+        out.message = "another optimize is already running (in the app or on the command line)";
+        return out;
+    }
+    std::string why;
+    if (!prepare_state(&why)) {
+        out.message = why;
+        return out;
+    }
+    Nvml nvml;
+    if (!nvml.Init()) {
+        out.message = "NVML init failed: " + nvml.Error();
+        return out;
+    }
+    const auto gpus = enumerate_gpus(nvml, &why);
+    if (!why.empty()) {
+        out.message = why;
+        return out;
+    }
+    const auto it = std::find_if(gpus.begin(), gpus.end(),
+                                 [&](const GpuInfo& gpu) { return gpu.uuid == gpu_uuid; });
+    if (it == gpus.end()) {
+        out.message = "the selected GPU is unavailable";
+        return out;
+    }
+    Nvapi nvapi;
+    if (!nvapi.Init()) {
+        out.message = "NVAPI init failed: " + nvapi.Error();
+        return out;
+    }
+    std::string control_why;
+    const auto control = make_gpu_control(nvml, nvapi, it->index, &control_why);
+    if (!control) {
+        out.message = "could not map the selected GPU between NVML and NVAPI: " + control_why;
+        return out;
+    }
+    const auto path = journal_path();
+    if (path.empty()) {
+        out.message = "the ProgramData folder could not be resolved; cannot keep the crash journal";
+        return out;
+    }
+    const auto lines = read_lines(path);
+    if (!lines) {
+        out.message = "the crash journal exists but cannot be read; not tuning without it";
+        return out;
+    }
+    Journal journal(*lines, [&path](const std::string& l) { return append_line_durable(path, l); });
+    if (!append_line_durable(path, "{\"session\":\"manual " + now_text() + "\"}")) {
+        out.message = "cannot write the crash journal; not tuning without it";
+        return out;
+    }
+    const auto range = nvml.PowerLimitRangePct(it->index).value_or(std::pair{kManualPowerHardMin, kManualPowerHardMax});
+    std::string apply_why;
+    if (!apply_manual(*control, tune, &journal, range.first, range.second, &apply_why)) {
+        out.message = apply_why;
+        boot_log("manual apply failed on GPU " + gpu_uuid + ": " + apply_why);
+        return out;
+    }
+    out.readback = control->read_applied();
+    const int core = manual_effective_core(tune);
+    const int mem = manual_effective_mem(tune);
+    const int power = manual_effective_power(tune);
+    out.ok = true;
+    out.message = "applied power " + std::to_string(power) + " %, core +" + std::to_string(core) + " MHz, mem +" +
+                  std::to_string(mem) + " MHz";
+    boot_log("manual apply on GPU " + gpu_uuid + ": " + out.message);
+    tell_tray(TrayNotice::TuneApplied);
+    return out;
+}
+
+bool save_manual_profile(const std::string& gpu_uuid, Preset preset, const ManualTune& tune, bool validated,
+                         const std::string& validation_note, std::string* message) {
+    auto say = [&](const std::string& m, bool ok) {
+        if (message) *message = m;
+        return ok;
+    };
+    const ManualTune snapped = manual_snap(tune);
+    std::string range_why;
+    if (!manual_in_range(snapped, kManualPowerHardMin, kManualPowerHardMax, &range_why)) return say(range_why, false);
+    Nvml nvml;
+    const std::string driver = nvml.Init() ? nvml.DriverVersion() : std::string();
+    if (driver.empty() || gpu_uuid.empty())
+        return say("NVML did not report the driver version or GPU id, so the profile could never be re-applied", false);
+    std::string why;
+    if (!prepare_state(&why)) return say(why, false);
+    Config cfg = load_config();
+    cfg.selected_gpu = gpu_uuid;
+    DeviceSettings& device = ensure_device(cfg, gpu_uuid);
+    device.profile = Profile{preset,
+                             manual_effective_power(snapped),
+                             manual_effective_core(snapped),
+                             manual_effective_mem(snapped),
+                             driver,
+                             gpu_uuid,
+                             now_text() + (validated ? " (validated: " + validation_note + ")" : " (not validated)"),
+                             std::nullopt,
+                             true};   // hand-tuned: the dashboard selects no preset for it
+    device.boot_strikes = 0;
+    if (!save_config(cfg)) return say("could not write " + config_path().string(), false);
+    return say(std::string("saved ") + profile_text(*device.profile), true);
 }
 
 }

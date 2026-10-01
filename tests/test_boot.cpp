@@ -107,11 +107,11 @@ TEST_CASE("a failed reset is reported, not claimed as stock") {
     CHECK(why.find("reset to stock FAILED") != std::string::npos);
 }
 
-TEST_CASE("values outside the search bounds are refused before anything is written") {
+TEST_CASE("values outside the manual bounds are refused before anything is written") {
     // gao.json is user-writable, and boot-apply runs elevated: never apply
-    // something --optimize could not have produced.
-    for (auto bad : {std::make_tuple(105, 400, 0), std::make_tuple(105, 0, 2000), std::make_tuple(105, -15, 0),
-                     std::make_tuple(300, 0, 0), std::make_tuple(10, 0, 0)}) {
+    // something neither --optimize nor the Manual page could have produced.
+    for (auto bad : {std::make_tuple(105, 400, 0), std::make_tuple(105, 0, 2000), std::make_tuple(105, -215, 0),
+                     std::make_tuple(105, 0, -550), std::make_tuple(300, 0, 0), std::make_tuple(10, 0, 0)}) {
         Card card;
         Profile p = *with_profile("x").profile;
         std::tie(p.power_pct, p.core_mhz, p.mem_mhz) = bad;
@@ -120,4 +120,15 @@ TEST_CASE("values outside the search bounds are refused before anything is writt
         CHECK(why.find("out of range") != std::string::npos);
         CHECK(card.writes == 0);
     }
+}
+
+TEST_CASE("a modest downclock from a hand-tuned profile applies") {
+    Card card;
+    Profile p = *with_profile("x").profile;
+    p.core_mhz = -150;
+    p.mem_mhz = -250;
+    std::string why;
+    CHECK(apply_profile(card.gpu(), p, &why));
+    CHECK(card.core == -150);
+    CHECK(card.mem == -250);
 }

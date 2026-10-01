@@ -17,10 +17,11 @@ BootDecision decide_boot(const DeviceSettings& device, const std::string& driver
 
 // Sets power, core and memory from the profile; each GpuControl setter
 // verifies by read-back. A setter the card lacks is fine only when the
-// profile asks for stock on that dimension. Values outside the search
-// bounds are refused before anything is written (gao.json is user-writable
-// and boot-apply runs elevated). Any failure resets to stock and returns
-// false with the reason in *why, including whether that reset worked.
+// profile asks for stock on that dimension. Values outside the manual bounds
+// (search ceiling upward, a modest downclock below stock) are refused before
+// anything is written (gao.json is user-writable and boot-apply runs
+// elevated). Any failure resets to stock and returns false with the reason
+// in *why, including whether that reset worked.
 bool apply_profile(const GpuControl& gpu, const Profile& p, std::string* why);
 
 }

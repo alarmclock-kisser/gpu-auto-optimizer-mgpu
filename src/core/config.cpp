@@ -40,6 +40,7 @@ nlohmann::json profile_json(const Profile& p) {
         {"driver", p.driver},
         {"gpu", p.gpu},
         {"saved_at", p.saved_at},
+        {"manual", p.manual},
     };
     if (p.fan_curve) j["fan_curve"] = curve_json(*p.fan_curve);
     return j;
@@ -65,6 +66,8 @@ std::optional<Profile> profile_from(const nlohmann::json& pj) {
     const auto driver = str("driver"), gpu = str("gpu"), saved_at = str("saved_at");
     if (!preset || !power || !core || !mem || !driver || !gpu || gpu->empty() || !saved_at) return std::nullopt;
     Profile p{*preset, *power, *core, *mem, *driver, *gpu, *saved_at};
+    // Profiles saved before the manual flag existed are optimizer results.
+    if (const auto it = pj.find("manual"); it != pj.end() && it->is_boolean()) p.manual = it->get<bool>();
     if (const auto it = pj.find("fan_curve"); it != pj.end()) p.fan_curve = curve_from(*it);
     return p;
 }

@@ -114,20 +114,31 @@ std::string Hr(const char* what, HRESULT hr) {
 
 }
 
-// The matching NVIDIA adapter, or null. `name` receives its description.
-ComPtr<IDXGIAdapter1> find_nvidia_adapter(const GpuLuid& luid, std::string* name) {
+// Match by LUID when NVML supplies one. Otherwise accept only a unique exact
+// adapter-name match; identical-name NVIDIA adapters remain ambiguous.
+ComPtr<IDXGIAdapter1> find_nvidia_adapter(const std::optional<GpuLuid>& luid, const std::string& expected_name,
+                                          std::string* name) {
     ComPtr<IDXGIFactory1> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return nullptr;
+    ComPtr<IDXGIAdapter1> name_match;
     ComPtr<IDXGIAdapter1> adapter;
-    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+    for (UINT i = 0;; ++i) {
+        const HRESULT result = factory->EnumAdapters1(i, &adapter);
+        if (result == DXGI_ERROR_NOT_FOUND) break;
+        if (FAILED(result)) return nullptr;
         DXGI_ADAPTER_DESC1 desc{};
-        adapter->GetDesc1(&desc);
-        if (desc.VendorId == kNvidiaVendorId && std::memcmp(&desc.AdapterLuid, luid.data(), luid.size()) == 0) {
-            *name = Narrow(desc.Description);
+        if (FAILED(adapter->GetDesc1(&desc)) || desc.VendorId != kNvidiaVendorId) continue;
+        if (luid && std::memcmp(&desc.AdapterLuid, luid->data(), luid->size()) == 0) {
+            if (name) *name = Narrow(desc.Description);
             return adapter;
         }
+        if (!luid && !expected_name.empty() && Narrow(desc.Description) == expected_name) {
+            if (name_match) return nullptr;
+            name_match = adapter;
+            if (name) *name = expected_name;
+        }
     }
-    return nullptr;
+    return name_match;
 }
 
 struct Stress::Impl {
@@ -147,8 +158,10 @@ struct Stress::Impl {
 Stress::Stress() : impl_(std::make_unique<Impl>()) {}
 Stress::~Stress() = default;
 
-bool Stress::Init(const GpuLuid& adapter_luid, StressSelftest selftest) {
+bool Stress::Init(const std::optional<GpuLuid>& adapter_luid, const std::string& adapter_name,
+                  StressSelftest selftest) {
     adapter_luid_ = adapter_luid;
+    expected_adapter_name_ = adapter_name;
     selftest_ = selftest;
     impl_->ha = make_stress_matrix(1);
     impl_->hb = make_stress_matrix(2);
@@ -173,8 +186,12 @@ bool Stress::CreateDevice() {
         ~ResetOnFailure() { if (!ok) d.device.Reset(); }
     } guard{d};
 
-    const ComPtr<IDXGIAdapter1> adapter = find_nvidia_adapter(adapter_luid_, &adapter_name_);
-    if (!adapter) { error_ = "no DXGI adapter matches the selected NVIDIA GPU"; return false; }
+    const ComPtr<IDXGIAdapter1> adapter = find_nvidia_adapter(adapter_luid_, expected_adapter_name_, &adapter_name_);
+    if (!adapter) {
+        error_ = adapter_luid_ ? "no DXGI adapter matches the selected NVIDIA GPU's LUID"
+                               : "could not uniquely match the selected NVIDIA GPU by name";
+        return false;
+    }
 
     const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
     HRESULT hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, &level, 1,

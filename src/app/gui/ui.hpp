@@ -17,7 +17,7 @@ enum class Screen { Choose, Run, Results };   // the Optimize page's state
 // Something the app did or was told this session, shown in the log with the
 // boot.log lines.
 struct Note {
-    std::string time;   // "YYYY-MM-DD HH:MM", as in boot.log
+    std::string time;   // Full local timestamp, for sorting with boot.log
     std::string text;
     bool warn = false;
 };
@@ -34,6 +34,7 @@ struct UiState {
     std::string gpu_error;
     std::string driver;
     Telemetry telemetry;
+    bool telemetry_ready = false;
     std::deque<float> temp_history;    // last minute, one sample per second
     std::deque<float> power_history;
 

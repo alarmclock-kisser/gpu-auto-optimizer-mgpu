@@ -27,6 +27,7 @@ struct GpuInfo {
 std::string gpu_label(const GpuInfo& gpu);
 bool is_elevated();
 std::string now_text();   // local time, "YYYY-MM-DD HH:MM"
+std::string log_timestamp_text();   // local time, "YYYY-MM-DD HH:MM:SS.fff"
 Config load_config();
 bool save_config(const Config& c);
 std::vector<GpuInfo> enumerate_gpus(Nvml& nvml, std::string* why = nullptr);

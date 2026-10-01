@@ -170,19 +170,24 @@ void telemetry_tiles(const UiState& s) {
     const Telemetry& t = s.telemetry;
     const float gap = ImGui::GetStyle().ItemSpacing.x;
     const float w = (ImGui::GetContentRegionAvail().x - gap * 4) / 5, h = em() * 4.2f;
-    tile("core", kIconChip, "Core clock", reading(t.core_mhz, " MHz"), w, h);
+    const std::string core = s.telemetry_ready ? reading(t.core_mhz, " MHz") : "N/A";
+    const std::string memory = s.telemetry_ready ? reading(t.mem_mhz, " MHz") : "N/A";
+    const std::string temperature = s.telemetry_ready ? reading(t.temp_c, " \xC2\xB0""C") : "N/A";
+    const std::string power = s.telemetry_ready ? reading(t.power_w, "") + " / " + reading(t.power_limit_w, " W")
+                                                : "N/A / N/A";
+    tile("core", kIconChip, "Core clock", core, w, h);
     ImGui::SameLine();
-    tile("mem", kIconMemory, "Memory clock", reading(t.mem_mhz, " MHz"), w, h);
+    tile("mem", kIconMemory, "Memory clock", memory, w, h);
     ImGui::SameLine();
-    tile("temp", kIconTemp, "Temperature", reading(t.temp_c, " \xC2\xB0""C"), w, h);
+    tile("temp", kIconTemp, "Temperature", temperature, w, h);
     ImGui::SameLine();
-    tile("power", kIconPower, "Power", reading(t.power_w, "") + " / " + reading(t.power_limit_w, " W"), w, h);
+    tile("power", kIconPower, "Power", power, w, h);
     ImGui::SameLine();
     const char* mode = s.fan_state.mode == FanMode::Curve     ? " (curve)"
                        : s.fan_state.mode == FanMode::Foreign ? " (other program)"
                        : s.fan_control && s.fan_available     ? " (driver)"
                                                               : "";
-    tile("fan", kIconFan, "Fan speed", reading(t.fan_pct, " %") + mode, w, h);
+    tile("fan", kIconFan, "Fan speed", s.telemetry_ready ? reading(t.fan_pct, " %") + mode : "N/A", w, h);
 }
 
 // The four presets side by side; clicking one selects it.
@@ -237,7 +242,8 @@ void gpu_card(const UiState& s, const UiActions& act) {
         for (const app::GpuInfo& gpu : s.gpus) {
             const std::string label = app::gpu_label(gpu);
             const bool is_selected = gpu.uuid == s.selected_gpu;
-            if (ImGui::Selectable(label.c_str(), is_selected) && act.select_gpu) act.select_gpu(gpu.uuid);
+            if (ImGui::Selectable(label.c_str(), is_selected) && !is_selected && act.select_gpu)
+                act.select_gpu(gpu.uuid);
             if (is_selected) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
@@ -358,24 +364,31 @@ void profiles_card(UiState& s) {
 }
 
 struct LogLine {
-    std::string time, text;
+    std::string time, order, text;
     bool warn;
 };
+
+std::string display_log_time(const std::string& value) {
+    if (value.size() >= 16 && value[4] == '-' && value[7] == '-' && value[10] == ' ') {
+        if (value.size() >= 23) return value.substr(11, 12);
+        return value.substr(11, 5) + ":00.000";
+    }
+    return value;
+}
 
 // boot.log lines and this session's notes, newest first.
 std::vector<LogLine> log_lines(const UiState& s) {
     std::vector<LogLine> out;
     for (const std::string& line : s.boot_log) {
         const size_t sep = line.find("  ");
-        LogLine l{sep == std::string::npos ? "" : line.substr(0, sep), sep == std::string::npos ? line : line.substr(sep + 2),
-                  false};
+        const std::string timestamp = sep == std::string::npos ? "" : line.substr(0, sep);
+        LogLine l{display_log_time(timestamp), timestamp, sep == std::string::npos ? line : line.substr(sep + 2), false};
         l.warn = l.text.find("not applied") != std::string::npos || l.text.find("failed") != std::string::npos ||
                  l.text.find("stopped") != std::string::npos || l.text.find("another program") != std::string::npos;
         out.push_back(std::move(l));
     }
-    for (const Note& n : s.notes) out.push_back({n.time, n.text, n.warn});
-    // Same-minute entries keep their order: boot.log first, then notes.
-    std::stable_sort(out.begin(), out.end(), [](const LogLine& a, const LogLine& b) { return a.time > b.time; });
+    for (const Note& n : s.notes) out.push_back({display_log_time(n.time), n.time, n.text, n.warn});
+    std::stable_sort(out.begin(), out.end(), [](const LogLine& a, const LogLine& b) { return a.order > b.order; });
     return out;
 }
 

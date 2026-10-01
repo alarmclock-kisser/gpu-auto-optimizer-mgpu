@@ -214,7 +214,7 @@ void tray_icon(DWORD message, const wchar_t* tip = nullptr, const wchar_t* ballo
 
 // A line in the window's log for this session.
 void note(const std::string& text, bool warn = false) {
-    g.ui.notes.push_back({gao::app::now_text(), text, warn});
+    g.ui.notes.push_back({gao::app::log_timestamp_text(), text, warn});
     if (g.ui.notes.size() > 100) g.ui.notes.erase(g.ui.notes.begin());
 }
 
@@ -389,6 +389,12 @@ void refresh_status(bool with_task) {
     const std::string previous_error = g.selected_gpu_error;
     if (target_changed || !g.selected_gpu_bound) {
         const std::string previous = g.selected_gpu;
+        if (target_changed) {
+            g.ui.telemetry = {};
+            g.ui.telemetry_ready = false;
+            g.ui.temp_history.clear();
+            g.ui.power_history.clear();
+        }
         if (!previous.empty() && previous != active_gpu) fan_release(previous);
         g.selected_gpu = active_gpu;
         g.selected_gpu_index = next_index;
@@ -486,6 +492,7 @@ bool refuse_while_tuning() {
 }
 
 void act_select_gpu(const std::string& gpu_uuid) {
+    if (gpu_uuid == g.selected_gpu) return;
     if (refuse_while_tuning()) return;
     const gao::app::GpuInfo* selected = gpu_info(gpu_uuid);
     if (!selected) { note("That NVIDIA GPU is no longer available.", true); return; }
@@ -677,10 +684,12 @@ void on_telemetry() {
     retry_hw();
     if (g.nvml_ok && g.selected_gpu_index) {
         g.ui.telemetry = g.nvml->Read(*g.selected_gpu_index);
+        g.ui.telemetry_ready = true;
         gao::gui::push_history(g.ui.temp_history, static_cast<float>(std::max(g.ui.telemetry.temp_c, 0)));
         gao::gui::push_history(g.ui.power_history, static_cast<float>(std::max(g.ui.telemetry.power_w, 0)));
     } else {
         g.ui.telemetry = {};
+        g.ui.telemetry_ready = false;
     }
     if (!g.worker->running() && !gao::app::tuning_in_progress()) {
         const auto now = std::chrono::steady_clock::now();

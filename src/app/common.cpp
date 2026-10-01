@@ -15,6 +15,7 @@
 #include <ctime>
 #include <chrono>
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 
 namespace gao::app {
@@ -75,6 +76,19 @@ std::string now_text() {
     return buf;
 }
 
+std::string log_timestamp_text() {
+    const auto now = std::chrono::system_clock::now();
+    const std::chrono::system_clock::time_point second = std::chrono::floor<std::chrono::seconds>(now);
+    const std::time_t t = std::chrono::system_clock::to_time_t(second);
+    const int milliseconds = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(now - second).count());
+    std::tm tm{};
+    localtime_s(&tm, &t);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03d", tm.tm_year + 1900, tm.tm_mon + 1,
+                  tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, milliseconds);
+    return buf;
+}
+
 Config load_config() {
     const auto text = read_file(config_path());
     return text ? from_json(*text) : Config{};
@@ -126,7 +140,7 @@ std::optional<GpuInfo> resolve_gpu(const std::vector<GpuInfo>& gpus, const Confi
 }
 
 void boot_log(const std::string& msg) {
-    append_line_durable(boot_log_path(), now_text() + "  " + msg);
+    append_line_durable(boot_log_path(), log_timestamp_text() + "  " + msg);
 }
 
 bool prepare_state(std::string* why) { return ensure_app_dir(why); }
@@ -183,9 +197,8 @@ OptimizeOutcome run_optimize(Preset preset, const std::string& requested_gpu_uui
     Nvapi nvapi;
     if (!nvapi.Init()) return fail("NVAPI init failed: " + nvapi.Error());
     const auto luid = nvml.DeviceLuid(gpu_info.index);
-    if (!luid) return fail("could not identify the selected DXGI adapter: " + nvml.Error());
     Stress load;
-    if (!load.Init(*luid)) return fail("stress init failed: " + load.Error());
+    if (!load.Init(luid, gpu_info.name)) return fail("stress init failed: " + load.Error());
     std::string control_why;
     const auto control = make_gpu_control(nvml, nvapi, gpu_info.index, &control_why);
     if (!control) return fail("could not map the selected GPU between NVML and NVAPI: " + control_why);

@@ -66,10 +66,10 @@ src/core/     pure logic: no windows.h, no driver calls, no D3D. Unit-tested in 
   task_xml.*      the logon task definition
   fan_curve.*     fan curves, the per-second controller and the FanDriver
 src/hw/       the only code that touches hardware or the OS state folders.
-  nvml.*          telemetry, UUID/name, PCI bus and DXGI LUID via NVML
+  nvml.*          telemetry, UUID/name, PCI bus and (when supported) DXGI LUID via NVML
   nvapi.*         clock offsets via NVAPI, verified by read-back
   gpu_control.*   maps NVML devices to NVAPI handles by PCI bus and wires GpuControl
-  stress.*        the DX11 compute load, matched to the selected GPU by LUID
+  stress.*        the DX11 compute load, matched by LUID or unique exact adapter name
   app_files.*     gao.json (atomic writes), the crash journal and boot.log, flushed to disk
   boot_task.*     the logon task and the Program Files copy
 src/app/
@@ -105,9 +105,9 @@ The applied offset is always at least one step below the confirmed edge. Profile
 | Fans through NVML, stop zone via the driver | NVIDIA's legacy NVAPI fan API is gone on RTX 20-series and newer; NVML's `nvmlDeviceSetFanSpeed_v2` is public and verified by reading the target back. Below the stop threshold the driver owns the fans, so no failure of this app can leave them stopped. |
 | Tray app plus logon task | Driver settings are volatile: a reboot or driver reset clears them. The logon task starts the tray app, whose watchdog keeps the tune applied; three crashing logons in a row switch it off. |
 | One profile per GPU | Optimizing a card updates only that card's profile. Logon apply and the watchdog operate on every saved profile independently; manual Apply/Revert and the live dashboard target the selected GPU. |
-| Stable GPU identity | NVML UUID is the persisted profile key, PCI bus ID maps to NVAPI, and the NVML LUID maps to the DXGI adapter. Device indices can vary between APIs or boots, so they are resolved at runtime rather than saved as identity. |
+| Stable GPU identity | NVML UUID is the persisted profile key, PCI bus ID maps to NVAPI, and NVML's LUID maps to the DXGI adapter when available. If NVML cannot provide the LUID, the stress test accepts only a unique exact NVIDIA adapter-name match. Device indices can vary between APIs or boots, so they are resolved at runtime rather than saved as identity. |
 | Per-GPU configuration migration | `gao.json` stores device records keyed by UUID, including each card's profile, fan settings and boot crash strikes, plus the selected UUID. The loader migrates the previous single-profile shape into a device record, preserving existing settings. |
-| Fail closed on ambiguous mapping | If a selected GPU cannot be uniquely mapped between NVML and NVAPI, control reports an error instead of guessing a handle. If its LUID cannot be matched to a DXGI adapter, stress-test setup fails instead of running on a different GPU. |
+| Fail closed on ambiguous mapping | If a selected GPU cannot be uniquely mapped between NVML and NVAPI, control reports an error instead of guessing a handle. DXGI matching prefers LUID; if that is unavailable, duplicate-name matches fail instead of running the stress test on a guessed GPU. |
 | Dear ImGui on DX11 | One small binary with no runtime, and the D3D11 device is in the process anyway for the stress load. |
 
 ## Rules the design depends on

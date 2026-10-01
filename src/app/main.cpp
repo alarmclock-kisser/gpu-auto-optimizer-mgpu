@@ -136,9 +136,8 @@ static int stress(int seconds, int max_temp_c, gao::StressSelftest selftest) {
     const auto gpu = selected_gpu(nvml);
     if (!gpu) return 1;
     const auto luid = nvml.DeviceLuid(gpu->index);
-    if (!luid) { std::printf("GPU adapter identification failed: %s\n", nvml.Error().c_str()); return 1; }
     gao::Stress load;
-    if (!load.Init(*luid, selftest)) { std::printf("stress init failed: %s\n", load.Error().c_str()); return 1; }
+    if (!load.Init(luid, gpu->name, selftest)) { std::printf("stress init failed: %s\n", load.Error().c_str()); return 1; }
     std::printf("stress: %s, %d s, abort above %d C\n", load.AdapterName().c_str(), seconds, max_temp_c);
 
     double t = 0, next_print = 1.0;
@@ -353,9 +352,8 @@ static int bandwidth() {
     const auto gpu = selected_gpu(nvml);
     if (!gpu) return 1;
     const auto luid = nvml.DeviceLuid(gpu->index);
-    if (!luid) { std::printf("GPU adapter identification failed: %s\n", nvml.Error().c_str()); return 1; }
     gao::Stress load;
-    if (!load.Init(*luid)) { std::printf("stress init failed: %s\n", load.Error().c_str()); return 1; }
+    if (!load.Init(luid, gpu->name)) { std::printf("stress init failed: %s\n", load.Error().c_str()); return 1; }
     const auto gbps = load.MeasureBandwidth();
     if (!gbps) { std::printf("bandwidth measurement failed: %s\n", load.Error().c_str()); return 1; }
     std::printf("memory bandwidth: %.1f GB/s (%s)\n", *gbps, load.AdapterName().c_str());

@@ -4,7 +4,7 @@ CI builds this project but has no GPU. These checks are the evidence that the
 hardware layer works. Run them on the real machine, record the date and
 driver version below, and fill in the Result column for each row.
 
-Checks 3-6 write to the GPU (clock offsets) through NVAPI, which
+Checks 3-6 and 45-46 write to the GPU (clock offsets) through NVAPI, which
 refuses those calls without administrator rights. Run `gao.exe` from an
 **elevated** PowerShell or Command Prompt (Start menu -> right-click
 PowerShell/Terminal -> "Run as administrator") for any command marked
@@ -68,6 +68,8 @@ root; adjust the path for a Debug build.
 | 42 | Another tool's fan speed | curve running, set a fixed fan speed in MSI Afterburner and Apply | yes (tray) | a balloon says another program set the fans; the app does not overwrite them | |
 | 43 | `gao --fan auto` | curve running, `gao --fan auto` in an elevated shell | yes | `fans: driver control -- OK`; then the tray re-applies the curve on its next tick | |
 | 44 | Fans during an optimize run | `gao --optimize best`, Ctrl+C during the core search | yes | during the run the fans follow the Best curve; after Ctrl+C `gao --status` shows `fans: driver control` | |
+| 45 | GPU mapping on a two-NVIDIA system | Select the second GPU in the dashboard; run `gao --stress 10`, then elevated `gao --set-core 15`; switch to the first GPU and check `gao --status`; reset both GPUs | yes | Stress names the selected card; the core write/read-back affects only that card; the other card remains unchanged | Not run; requires two NVIDIA GPUs |
+| 46 | Per-GPU profiles at logon | Optimize both GPUs separately, enable Apply at logon, then sign out and back in | yes | Both saved profiles remain listed and are applied to their matching GPUs; each GPU's crash strikes are independent | Not run; requires two NVIDIA GPUs |
 
 ## Notes
 

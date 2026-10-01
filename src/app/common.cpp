@@ -14,6 +14,7 @@
 #include "hw/stress.hpp"
 #include <ctime>
 #include <chrono>
+#include <algorithm>
 #include <filesystem>
 
 namespace gao::app {
@@ -83,6 +84,42 @@ bool save_config(const Config& c) {
     return !config_path().empty() && write_file_atomic(config_path(), to_json(c));
 }
 
+std::vector<GpuInfo> enumerate_gpus(Nvml& nvml, std::string* why) {
+    std::vector<GpuInfo> gpus;
+    const int count = nvml.DeviceCount();
+    if (count < 0) {
+        if (why) *why = "NVML device enumeration failed: " + nvml.Error();
+        return gpus;
+    }
+    for (int i = 0; i < count; ++i) {
+        const unsigned index = static_cast<unsigned>(i);
+        const std::string uuid = nvml.GpuUuid(index);
+        if (uuid.empty()) {
+            if (why) *why = "NVML did not report a UUID for GPU " + std::to_string(i) + ": " + nvml.Error();
+            return {};
+        }
+        std::string name = nvml.DeviceName(index);
+        if (name.empty()) name = "NVIDIA GPU " + std::to_string(i);
+        gpus.push_back({index, uuid, std::move(name)});
+    }
+    return gpus;
+}
+
+std::optional<GpuInfo> resolve_gpu(const std::vector<GpuInfo>& gpus, const Config& config, std::string* why) {
+    if (gpus.empty()) {
+        if (why) *why = "no NVIDIA GPUs are available";
+        return std::nullopt;
+    }
+    if (config.selected_gpu.empty()) return gpus.front();
+    const auto it = std::find_if(gpus.begin(), gpus.end(),
+                                 [&](const GpuInfo& gpu) { return gpu.uuid == config.selected_gpu; });
+    if (it == gpus.end()) {
+        if (why) *why = "the selected GPU is unavailable; select an installed GPU in the dashboard";
+        return std::nullopt;
+    }
+    return *it;
+}
+
 void boot_log(const std::string& msg) {
     append_line_durable(boot_log_path(), now_text() + "  " + msg);
 }
@@ -95,21 +132,23 @@ std::string profile_text(const Profile& p) {
            ", saved " + p.saved_at + ")";
 }
 
-std::string decision_text(BootDecision d, const Config& c, const std::string& driver) {
+std::string decision_text(BootDecision d, const Profile* profile, const std::string& driver) {
     switch (d) {
         case BootDecision::NoProfile: return "no saved profile; run an optimize first";
         case BootDecision::TooManyStrikes:
             return "disabled after " + std::to_string(kMaxBootStrikes) + " crashes; turn boot-apply on again to retry";
         case BootDecision::DriverChanged:
             if (driver.empty()) return "driver version unknown (NVML did not report it); not applied";
-            return "driver changed (" + c.profile->driver + " -> " + driver + "); optimize again";
+            return "driver changed (" + (profile ? profile->driver : std::string("unknown")) + " -> " + driver +
+                   "); optimize again";
         case BootDecision::GpuChanged: return "this is not the card the profile was tested on; optimize again";
         case BootDecision::Apply: return "apply";
     }
     return "unknown";
 }
 
-OptimizeOutcome run_optimize(Preset preset, const OptimizeHooks& hooks, const std::optional<FanCurve>& fan_curve) {
+OptimizeOutcome run_optimize(Preset preset, const std::string& requested_gpu_uuid, const OptimizeHooks& hooks,
+                             const std::optional<FanCurve>& fan_curve) {
     OptimizeOutcome out;
     auto log = [&](const std::string& m) { if (hooks.log) hooks.log(m); };
     auto fail = [&](const std::string& why) { out.error = why; return out; };
@@ -120,15 +159,36 @@ OptimizeOutcome run_optimize(Preset preset, const OptimizeHooks& hooks, const st
     if (!prepare_state(&why)) return fail(why);
     Nvml nvml;
     if (!nvml.Init()) return fail("NVML init failed: " + nvml.Error());
+    const Config current = load_config();
+    std::string gpu_why;
+    const auto gpus = enumerate_gpus(nvml, &gpu_why);
+    if (!gpu_why.empty()) return fail(gpu_why);
+    const std::optional<GpuInfo> selected = requested_gpu_uuid.empty()
+                                                ? resolve_gpu(gpus, current, &gpu_why)
+                                                : [&]() -> std::optional<GpuInfo> {
+                                                      const auto it = std::find_if(
+                                                          gpus.begin(), gpus.end(), [&](const GpuInfo& gpu) {
+                                                              return gpu.uuid == requested_gpu_uuid;
+                                                          });
+                                                      return it == gpus.end() ? std::nullopt : std::optional<GpuInfo>(*it);
+                                                  }();
+    if (!selected) return fail(gpu_why.empty() ? "the selected GPU is unavailable" : gpu_why);
+    const std::string& gpu_uuid = selected->uuid;
+    const GpuInfo& gpu_info = *selected;
     Nvapi nvapi;
     if (!nvapi.Init()) return fail("NVAPI init failed: " + nvapi.Error());
+    const auto luid = nvml.DeviceLuid(gpu_info.index);
+    if (!luid) return fail("could not identify the selected DXGI adapter: " + nvml.Error());
     Stress load;
-    if (!load.Init()) return fail("stress init failed: " + load.Error());
-    const GpuControl gpu = make_gpu_control(nvml, nvapi, kGpu);
+    if (!load.Init(*luid)) return fail("stress init failed: " + load.Error());
+    std::string control_why;
+    const auto control = make_gpu_control(nvml, nvapi, gpu_info.index, &control_why);
+    if (!control) return fail("could not map the selected GPU between NVML and NVAPI: " + control_why);
+    const GpuControl gpu = *control;
     // The profile's curve drives the fans for the whole run, so the clocks it
     // finds hold at the temperatures that curve produces.
     const FanCurve curve = fan_curve.value_or(default_curve(preset));
-    FanDriver fans(gpu, curve, objectives_for(preset).max_temp_c, fan_min_for(load_config(), nvml.GpuUuid(kGpu), gpu.fan_min_pct));
+    FanDriver fans(gpu, curve, objectives_for(preset).max_temp_c, fan_min_for(load_config(), gpu_uuid, gpu.fan_min_pct));
     struct FanRelease {
         FanDriver& f;
         ~FanRelease() { f.release(); }   // every exit: done, aborted, failed or thrown
@@ -179,24 +239,25 @@ OptimizeOutcome run_optimize(Preset preset, const OptimizeHooks& hooks, const st
     out.ran = true;
     if (!out.result.ok) return out;
 
-    const std::string driver = nvml.DriverVersion(), gpu_id = nvml.GpuUuid(kGpu);
-    if (driver.empty() || gpu_id.empty()) {
+    const std::string driver = nvml.DriverVersion();
+    if (driver.empty() || gpu_uuid.empty()) {
         out.save_note = "NVML did not report the driver version or GPU id, so the profile could never be re-applied";
         return out;
     }
     Config cfg = load_config();
-    cfg.profile = Profile{preset, out.result.power_pct, out.result.core_mhz, out.result.mem_mhz, driver, gpu_id, now_text()};
-    cfg.fan_curve.reset();   // a new tune starts from its own curve
+    cfg.selected_gpu = gpu_uuid;
+    DeviceSettings& device = ensure_device(cfg, gpu_uuid);
+    device.profile = Profile{preset, out.result.power_pct, out.result.core_mhz, out.result.mem_mhz, driver, gpu_uuid, now_text()};
+    device.fan_curve.reset();   // a new tune starts from its own curve
     // Only a curve that actually drove the fans counts as tested.
     if (gpu.set_fan_pct && fans.state().mode != FanMode::Failed && fans.state().mode != FanMode::Foreign) {
-        cfg.profile->fan_curve = curve;   // what the run was tested with
-        cfg.fan_control = true;
-        if (fans.state().min_pct > fan_min_for(cfg, gpu_id, gpu.fan_min_pct)) {   // learned during the run
-            cfg.fan_min_pct = fans.state().min_pct;
-            cfg.fan_min_gpu = gpu_id;
+        device.profile->fan_curve = curve;   // what the run was tested with
+        device.fan_control = true;
+        if (fans.state().min_pct > fan_min_for(cfg, gpu_uuid, gpu.fan_min_pct)) {
+            device.fan_min_pct = fans.state().min_pct;
         }
     }
-    cfg.boot_strikes = 0;   // strikes belong to the profile they were earned by
+    device.boot_strikes = 0;
     out.saved = save_config(cfg);
     if (!out.saved) out.save_note = "could not write " + config_path().string();
     return out;
@@ -204,41 +265,88 @@ OptimizeOutcome run_optimize(Preset preset, const OptimizeHooks& hooks, const st
 
 BootApplyOutcome apply_at_logon() {
     BootApplyOutcome out;
-    auto done = [&](const std::string& msg) { out.message = msg; boot_log(msg); return out; };
+    auto record = [&](const std::string& msg) {
+        if (!out.message.empty()) out.message += "\n";
+        out.message += msg;
+        boot_log(msg);
+    };
     Nvml nvml;
-    if (!nvml.Init()) return done("NVML init failed: " + nvml.Error());
+    if (!nvml.Init()) {
+        record("NVML init failed: " + nvml.Error());
+        return out;
+    }
     Config cfg = load_config();
     const std::string driver = nvml.DriverVersion();
-    const auto d = decide_boot(cfg, driver, nvml.GpuUuid(kGpu));
-    out.decision = d;
-    if (d != BootDecision::Apply) return done("not applied: " + decision_text(d, cfg, driver));
-    // The strike is on disk before the hardware is touched: a crash from here
-    // on counts.
-    ++cfg.boot_strikes;
-    if (!save_config(cfg)) return done("could not record the strike; not applying");
+    std::string list_why;
+    const std::vector<GpuInfo> gpus = enumerate_gpus(nvml, &list_why);
+    if (!list_why.empty()) {
+        record(list_why);
+        return out;
+    }
     Nvapi nvapi;
-    if (!nvapi.Init()) return done("NVAPI init failed: " + nvapi.Error());
-    std::string why;
-    if (!apply_profile(make_gpu_control(nvml, nvapi, kGpu), *cfg.profile, &why)) return done("apply failed: " + why);
-    out.applied = true;
-    out.profile = *cfg.profile;
-    return done("applied " + profile_text(*cfg.profile) + ", strike " + std::to_string(cfg.boot_strikes) +
-                " clears in 2 minutes");
+    bool nvapi_ready = false;
+    for (DeviceSettings& device : cfg.devices) {
+        if (!device.profile) continue;
+        const auto gpu = std::find_if(gpus.begin(), gpus.end(),
+                                      [&](const GpuInfo& item) { return item.uuid == device.gpu; });
+        const std::string actual_gpu = gpu == gpus.end() ? std::string() : gpu->uuid;
+        const BootDecision decision = decide_boot(device, driver, actual_gpu);
+        if (decision != BootDecision::Apply) {
+            record("GPU " + device.gpu + " not applied: " + decision_text(decision, &*device.profile, driver));
+            continue;
+        }
+        if (!nvapi_ready) {
+            if (!nvapi.Init()) {
+                record("NVAPI init failed: " + nvapi.Error());
+                break;
+            }
+            nvapi_ready = true;
+        }
+        std::string why;
+        const auto control = make_gpu_control(nvml, nvapi, gpu->index, &why);
+        if (!control) {
+            record("GPU " + device.gpu + " could not be mapped between NVML and NVAPI: " + why);
+            continue;
+        }
+        ++device.boot_strikes;
+        if (!save_config(cfg)) {
+            record("GPU " + device.gpu + " could not record the crash strike; not applied");
+            continue;
+        }
+        out.strike_gpus.push_back(device.gpu);
+        if (!apply_profile(*control, *device.profile, &why)) {
+            record("GPU " + device.gpu + " apply failed: " + why);
+            continue;
+        }
+        out.applied = true;
+        out.applied_gpus.push_back(device.gpu);
+        record("GPU " + device.gpu + " applied " + profile_text(*device.profile) +
+               ", strike " + std::to_string(device.boot_strikes) + " clears in 2 minutes");
+    }
+    if (out.message.empty()) record("no saved GPU profiles; run an optimize first");
+    return out;
 }
 
-void clear_boot_strike() {
-    // Reload: an optimize may have saved a new profile meanwhile; only the
-    // counter is ours to change. If the file cannot be read, or reads without
-    // a profile, writing would destroy it: leave the strike (fails safe).
+void clear_boot_strikes(const std::vector<std::string>& gpu_uuids) {
+    if (gpu_uuids.empty()) return;
     for (int attempt = 0; attempt < 3; ++attempt) {
         const auto text = read_file(config_path());
         Config latest = text ? from_json(*text) : Config{};
-        if (!latest.profile) { boot_log("could not re-read gao.json to clear the strike; it stays"); return; }
-        latest.boot_strikes = 0;
-        if (save_config(latest)) { boot_log("ran 2 minutes without a crash; strike cleared"); return; }
+        bool changed = false;
+        for (const std::string& gpu : gpu_uuids) {
+            if (DeviceSettings* device = find_device(latest, gpu); device && device->profile) {
+                device->boot_strikes = 0;
+                changed = true;
+            }
+        }
+        if (!changed) {
+            boot_log("could not re-read gao.json to clear the boot strikes; they stay");
+            return;
+        }
+        if (save_config(latest)) { boot_log("ran 2 minutes without a crash; GPU boot strikes cleared"); return; }
         Sleep(1000);
     }
-    boot_log("could not save gao.json to clear the strike; it stays");
+    boot_log("could not save gao.json to clear the boot strikes; they stay");
 }
 
 bool enable_boot(std::string* message) {
@@ -265,10 +373,14 @@ bool enable_boot(std::string* message) {
     std::filesystem::remove(xml_path, ec);
     if (code != 0) return say("could not create the task (schtasks exit " + std::to_string(code) + ")", false);
     Config cfg = load_config();
-    cfg.boot_strikes = 0;
+    for (DeviceSettings& device : cfg.devices) device.boot_strikes = 0;
     if (!save_config(cfg)) return say("task created, but could not reset the strike counter", false);
     return say("boot-apply on: " + exe.string() + " --tray runs at every logon and keeps the tune applied (strikes reset)" +
-               (cfg.profile ? "" : "; note: there is no saved profile yet, optimize first"), true);
+               (std::any_of(cfg.devices.begin(), cfg.devices.end(),
+                            [](const DeviceSettings& device) { return device.profile.has_value(); })
+                    ? ""
+                    : "; note: there are no saved GPU profiles yet, optimize first"),
+               true);
 }
 
 bool disable_boot(std::string* message) {

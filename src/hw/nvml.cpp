@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <algorithm>
+#include <cstring>
 
 namespace gao {
 
@@ -18,6 +19,18 @@ typedef nvmlReturn_t (*fn_temp)(nvmlDevice_t, int sensor, unsigned*);
 typedef nvmlReturn_t (*fn_power)(nvmlDevice_t, unsigned*);
 typedef nvmlReturn_t (*fn_powerlimit)(nvmlDevice_t, unsigned*);
 typedef nvmlReturn_t (*fn_fan)(nvmlDevice_t, unsigned*);
+typedef nvmlReturn_t (*fn_name)(nvmlDevice_t, char*, unsigned);
+struct nvml_pci_info_v3 {
+    char bus_id_legacy[16];
+    unsigned domain;
+    unsigned bus;
+    unsigned device;
+    unsigned pci_device_id;
+    unsigned pci_subsystem_id;
+    char bus_id[32];
+};
+typedef nvmlReturn_t (*fn_pci_info)(nvmlDevice_t, nvml_pci_info_v3*);
+typedef nvmlReturn_t (*fn_luid)(nvmlDevice_t, char*, unsigned*);
 
 static fn_init        p_init = nullptr;
 static fn_shutdown    p_shutdown = nullptr;
@@ -28,6 +41,9 @@ static fn_temp        p_temp = nullptr;
 static fn_power       p_power = nullptr;
 static fn_powerlimit  p_powerlimit = nullptr;
 static fn_fan         p_fan = nullptr;
+static fn_name        p_name = nullptr;
+static fn_pci_info    p_pci_info = nullptr;
+static fn_luid        p_luid = nullptr;
 typedef nvmlReturn_t (*fn_pl_default)(nvmlDevice_t, unsigned*);
 typedef nvmlReturn_t (*fn_pl_constraints)(nvmlDevice_t, unsigned*, unsigned*);
 typedef nvmlReturn_t (*fn_pl_set)(nvmlDevice_t, unsigned);
@@ -68,6 +84,9 @@ bool Nvml::Init() {
     p_power      = (fn_power)GetProcAddress(h, "nvmlDeviceGetPowerUsage");
     p_powerlimit = (fn_powerlimit)GetProcAddress(h, "nvmlDeviceGetPowerManagementLimit");
     p_fan        = (fn_fan)GetProcAddress(h, "nvmlDeviceGetFanSpeed");
+    p_name       = (fn_name)GetProcAddress(h, "nvmlDeviceGetName");
+    p_pci_info   = (fn_pci_info)GetProcAddress(h, "nvmlDeviceGetPciInfo_v3");
+    p_luid       = (fn_luid)GetProcAddress(h, "nvmlDeviceGetLuid");
     p_pl_default     = (fn_pl_default)GetProcAddress(h, "nvmlDeviceGetPowerManagementDefaultLimit");
     p_pl_constraints = (fn_pl_constraints)GetProcAddress(h, "nvmlDeviceGetPowerManagementLimitConstraints");
     p_pl_set         = (fn_pl_set)GetProcAddress(h, "nvmlDeviceSetPowerManagementLimit");
@@ -123,6 +142,16 @@ Telemetry Nvml::Read(unsigned index) {
     // be -1 (unknown) with ok == true; callers check those individually.
     t.ok = core_ok && temp_ok;
     return t;
+}
+
+std::string Nvml::DeviceName(unsigned index) {
+    nvmlDevice_t dev = nullptr;
+    char buf[96] = {};
+    if (!inited_ || !p_name || p_byIndex(index, &dev) != NVML_SUCCESS || p_name(dev, buf, sizeof(buf)) != NVML_SUCCESS) {
+        error_ = "nvmlDeviceGetName failed";
+        return {};
+    }
+    return buf;
 }
 
 std::optional<std::pair<int, int>> Nvml::PowerLimitRangePct(unsigned index) {
@@ -197,6 +226,31 @@ std::string Nvml::GpuUuid(unsigned index) {
         return {};
     }
     return buf;
+}
+
+std::optional<unsigned> Nvml::GpuBusId(unsigned index) {
+    nvmlDevice_t dev = nullptr;
+    nvml_pci_info_v3 info{};
+    if (!inited_ || !p_pci_info || p_byIndex(index, &dev) != NVML_SUCCESS ||
+        p_pci_info(dev, &info) != NVML_SUCCESS) {
+        error_ = "nvmlDeviceGetPciInfo_v3 failed";
+        return std::nullopt;
+    }
+    return info.bus;
+}
+
+std::optional<GpuLuid> Nvml::DeviceLuid(unsigned index) {
+    nvmlDevice_t dev = nullptr;
+    char luid[8] = {};
+    unsigned node_mask = 0;
+    if (!inited_ || !p_luid || p_byIndex(index, &dev) != NVML_SUCCESS ||
+        p_luid(dev, luid, &node_mask) != NVML_SUCCESS) {
+        error_ = "nvmlDeviceGetLuid failed";
+        return std::nullopt;
+    }
+    GpuLuid result{};
+    std::memcpy(result.data(), luid, result.size());
+    return result;
 }
 
 Nvml::~Nvml() {

@@ -3,11 +3,11 @@
 
 namespace gao {
 
-BootDecision decide_boot(const Config& c, const std::string& driver, const std::string& gpu) {
-    if (!c.profile) return BootDecision::NoProfile;
-    if (c.boot_strikes >= kMaxBootStrikes) return BootDecision::TooManyStrikes;
-    if (driver.empty() || driver != c.profile->driver) return BootDecision::DriverChanged;
-    if (gpu.empty() || gpu != c.profile->gpu) return BootDecision::GpuChanged;
+BootDecision decide_boot(const DeviceSettings& device, const std::string& driver, const std::string& gpu) {
+    if (!device.profile) return BootDecision::NoProfile;
+    if (device.boot_strikes >= kMaxBootStrikes) return BootDecision::TooManyStrikes;
+    if (driver.empty() || driver != device.profile->driver) return BootDecision::DriverChanged;
+    if (gpu.empty() || gpu != device.gpu || gpu != device.profile->gpu) return BootDecision::GpuChanged;
     return BootDecision::Apply;
 }
 

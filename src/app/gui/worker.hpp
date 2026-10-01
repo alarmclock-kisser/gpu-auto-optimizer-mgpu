@@ -24,7 +24,8 @@ public:
     explicit OptimizeWorker(std::function<void()> wake) : wake_(std::move(wake)) {}
     ~OptimizeWorker();
 
-    bool start(Preset preset, std::optional<FanCurve> fan_curve);   // false when a run is already active
+    bool start(Preset preset, std::string gpu_uuid, std::optional<FanCurve> fan_curve);
+    // false when a run is already active
     void abort() { abort_ = true; }     // the run restores stock before it ends
     bool running() const { return running_; }
     Snapshot snapshot() const;

@@ -1,5 +1,6 @@
 #pragma once
 #include "core/stability.hpp"
+#include "hw/nvml.hpp"
 #include <memory>
 #include <optional>
 #include <string>
@@ -18,15 +19,11 @@ enum class StressSelftest {
 // The DX11 compute stress load. Multiplies two exact-float matrices (see
 // core/stress_math.hpp) and has the GPU count every output element that
 // differs from the uploaded CPU reference. Changes no GPU settings.
-// Name of the first NVIDIA adapter DXGI reports ("NVIDIA GeForce RTX 4070"),
-// or empty. Cheap: no device, no shader.
-std::string nvidia_adapter_name();
-
 class Stress {
 public:
     Stress();
     ~Stress();
-    bool Init(StressSelftest selftest = StressSelftest::None);
+    bool Init(const GpuLuid& adapter_luid, StressSelftest selftest = StressSelftest::None);
     // One batch of dispatches. Batches start at one dispatch and double until
     // they take ~250 ms. After a lost device, the next call recreates it.
     StressBatch Batch();
@@ -43,6 +40,7 @@ private:
     StressSelftest selftest_ = StressSelftest::None;
     std::string error_;
     std::string adapter_name_;
+    GpuLuid adapter_luid_{};
     int dispatches_ = 1;
     bool CreateDevice();
 };

@@ -23,6 +23,7 @@
 GPU Auto Optimizer tunes the **power limit** and the **core and memory clock offsets** of an NVIDIA card. It stress-tests every candidate setting and keeps the highest one that computes correct results, then backs off by a safety margin. You pick a goal and press one button; a run takes about ten minutes.
 
 - **Four profiles:** Best of my GPU, Cool & efficient, Quiet and Max performance.
+- **Multiple NVIDIA GPUs:** choose a card from the dashboard. Each card keeps its own tune, fan settings and crash history; saved tunes are applied to their matching cards at logon.
 - **Verified, not trusted:** every value written to the driver is read back and checked, and a failed apply ends at stock.
 - **Crash-proof search:** a journal on disk records each candidate before it is tried, so a setting that froze the machine is never tried again.
 - **Stays applied:** the tray app re-applies the tune at every logon, and within about half a minute after a driver reset (TDR).
@@ -34,7 +35,7 @@ GPU Auto Optimizer tunes the **power limit** and the **core and memory clock off
 
 1. Download `GpuAutoOptimizer-<version>-win-x64.zip` from the [latest release](https://github.com/Rovey/gpu-auto-optimizer/releases/latest) and unzip it anywhere.
 2. Start **`GpuAutoOptimizer.exe`**.
-3. Open **Optimize**, pick a profile and press **Optimize GPU**. The app asks for administrator rights, because it changes clocks and power limits.
+3. Select a GPU in the dashboard, open **Optimize**, pick a profile and press **Optimize GPU**. The app asks for administrator rights, because it changes clocks and power limits.
 4. When the run is done, turn on **Apply at logon** to keep the result after a restart.
 
 > [!NOTE]
@@ -81,21 +82,21 @@ flowchart LR
 - **Stress test.** A DirectX 11 compute load in which the GPU checks every value it computes against a known answer. Each probe ends in a verdict: `STABLE`, `WRONG RESULT`, `DEVICE LOST`, `TOO HOT` or `NO TELEMETRY`.
 - **Memory stops at the bandwidth peak,** not at the first error. GDDR6 and GDDR6X retry failed transfers, so an overclocked memory bus loses speed long before it returns a wrong result. The search measures bandwidth at each step and keeps the lowest offset within 1 % of the best.
 - **Crash journal.** Before a candidate touches the hardware, a `begin` line is flushed to disk. If the machine freezes, the unmatched `begin` becomes a ceiling the next run stays below.
-- **Apply at logon.** A scheduled task starts the app in the tray at logon, which applies the saved profile. It refuses when the driver version or the card changed since tuning, and it stops after three logons in a row that crashed within two minutes.
-- **Tune watchdog.** Every 30 seconds the tray app reads back what the driver reports. It re-applies after a reset, gives up if the tune is reset four times in an hour (a sign it is not stable), and backs off when another program changed the settings.
+- **Apply at logon.** A scheduled task starts the app in the tray at logon, which applies every saved profile to its UUID-matched GPU. It refuses when the driver version or card changed since tuning; crash strikes are tracked independently per GPU.
+- **Tune watchdog.** Every 30 seconds the tray app checks each GPU whose tune it applied. It re-applies after a reset, gives up on that card if its tune is reset four times in an hour, and backs off when another program changed its settings.
 
 ## Command line
 
-`gao.exe` ships next to the app and drives the same engine. Commands that write to the GPU need an elevated shell.
+`gao.exe` ships next to the app and drives the same engine. Commands that target one GPU use the UUID selected in the dashboard (or the first NVIDIA GPU if no selection has been saved); `--probe` lists telemetry for every NVIDIA GPU. Commands that write to the GPU need an elevated shell.
 
 | Command | What it does |
 |---|---|
 | `gao --optimize best\|quiet\|cool\|max [--fan-curve silent\|normal\|cool\|aggressive]` | Runs the search; exit code 0 when saved, 2 when applied but not saved |
-| `gao --apply` | Re-applies the saved profile |
-| `gao --reset` | Returns to stock clocks and the default power limit |
+| `gao --apply` | Re-applies the selected GPU's saved profile |
+| `gao --reset` | Returns the selected GPU to stock clocks and the default power limit |
 | `gao --boot on\|off` | Turns apply-at-logon on or off |
 | `gao --fan auto` | Hands every fan back to the NVIDIA driver, whatever set it (a running tray app takes them again on its next tick; switch Fan control off to keep the driver in charge) |
-| `gao --status` | Saved profile, what is applied now, apply-at-logon state |
+| `gao --status` | Saved profiles for all GPUs, the selected GPU's current settings, apply-at-logon state |
 | `gao --probe` | Live telemetry: clocks, temperature, fan, power |
 | `gao --stress <seconds>` | Runs the stress test alone and prints its verdict; changes nothing |
 | `gao --bandwidth` | Measures the current memory bandwidth |
@@ -103,6 +104,12 @@ flowchart LR
 Ctrl+C during `--optimize` restores stock.
 
 ## FAQ
+
+<details>
+<summary><b>How does it handle more than one NVIDIA GPU?</b></summary>
+
+Choose a card from the GPU dropdown at the top of the dashboard. Each card has its own profile, fan settings and crash strikes; optimizing another card does not replace the first card's profile. Apply at logon applies all saved profiles to their matching cards, while manual **Apply** and **Revert to stock** act on the selected card.
+</details>
 
 <details>
 <summary><b>Does it work alongside MSI Afterburner?</b></summary>
@@ -137,7 +144,7 @@ No. Locking a voltage point froze the reference card during development, so no p
 <details>
 <summary><b>Where does it keep its data?</b></summary>
 
-In `%ProgramData%\GpuAutoOptimizer`: `gao.json` (the saved profile), `journal.jsonl` (the crash journal) and `boot.log`. Users can read the folder; only administrators can write it, because the logon task runs with administrator rights.
+In `%ProgramData%\GpuAutoOptimizer`: `gao.json` (selected GPU and per-GPU profiles/settings), `journal.jsonl` (the crash journal) and `boot.log`. Users can read the folder; only administrators can write it, because the logon task runs with administrator rights.
 </details>
 
 ## Building from source

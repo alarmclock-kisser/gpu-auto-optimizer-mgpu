@@ -29,13 +29,16 @@ struct UiState {
     Preset preset = Preset::BestOfMyGpu;
     bool elevated = false;
 
-    std::string gpu_name;
+    std::vector<app::GpuInfo> gpus;
+    std::string selected_gpu;
+    std::string gpu_error;
     std::string driver;
     Telemetry telemetry;
     std::deque<float> temp_history;    // last minute, one sample per second
     std::deque<float> power_history;
 
     std::optional<Profile> profile;
+    bool has_profiles = false;
     bool profile_driver_ok = false;
     bool profile_gpu_ok = false;
     std::optional<AppliedState> applied;
@@ -62,6 +65,7 @@ struct UiActions {
     std::function<void()> revert_to_stock;
     std::function<void(bool)> set_boot;
     std::function<void()> detect_gpu;
+    std::function<void(const std::string&)> select_gpu;
     std::function<void(const FanCurve&)> set_fan_curve;   // saves it as the active curve
     std::function<void(bool)> set_fan_control;
     std::function<void()> reset_fan_curve;                // back to the tested/default curve

@@ -13,7 +13,7 @@ enum class BootDecision { Apply, NoProfile, TooManyStrikes, DriverChanged, GpuCh
 // Order: no profile, strikes, driver, GPU. An empty (unknown) driver or GPU
 // id never matches, so a failed NVML query cannot apply offsets that were
 // tested on some other driver or card.
-BootDecision decide_boot(const Config& c, const std::string& driver, const std::string& gpu);
+BootDecision decide_boot(const DeviceSettings& device, const std::string& driver, const std::string& gpu);
 
 // Sets power, core and memory from the profile; each GpuControl setter
 // verifies by read-back. A setter the card lacks is fine only when the

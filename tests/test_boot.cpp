@@ -6,17 +6,18 @@
 using namespace gao;
 
 namespace {
-Config with_profile(const std::string& driver, int strikes = 0, const std::string& gpu = "GPU-1") {
-    Config c;
+DeviceSettings with_profile(const std::string& driver, int strikes = 0, const std::string& gpu = "GPU-1") {
+    DeviceSettings device;
+    device.gpu = gpu;
     Profile p;
     p.power_pct = 105;
     p.core_mhz = 135;
     p.mem_mhz = 1050;
     p.driver = driver;
     p.gpu = gpu;
-    c.profile = p;
-    c.boot_strikes = strikes;
-    return c;
+    device.profile = p;
+    device.boot_strikes = strikes;
+    return device;
 }
 
 struct Card {
@@ -36,7 +37,7 @@ struct Card {
 }
 
 TEST_CASE("decide_boot: each outcome") {
-    CHECK(decide_boot(Config{}, "610.74", "GPU-1") == BootDecision::NoProfile);
+    CHECK(decide_boot(DeviceSettings{}, "610.74", "GPU-1") == BootDecision::NoProfile);
     CHECK(decide_boot(with_profile("610.74", 3), "610.74", "GPU-1") == BootDecision::TooManyStrikes);
     CHECK(decide_boot(with_profile("610.74"), "615.20", "GPU-1") == BootDecision::DriverChanged);
     CHECK(decide_boot(with_profile("610.74", 2), "610.74", "GPU-1") == BootDecision::Apply);
@@ -88,6 +89,13 @@ TEST_CASE("a profile only applies to the GPU it was tested on") {
     CHECK(decide_boot(with_profile("610.74"), "610.74", "") == BootDecision::GpuChanged);
     CHECK(decide_boot(with_profile("610.74", 0, ""), "610.74", "") == BootDecision::GpuChanged);
     CHECK(decide_boot(with_profile("610.74", 0, "GPU-1"), "615.20", "GPU-2") == BootDecision::DriverChanged);
+}
+
+TEST_CASE("boot strikes and profiles are independent per GPU") {
+    DeviceSettings first = with_profile("610.74", kMaxBootStrikes, "GPU-1");
+    DeviceSettings second = with_profile("610.74", 0, "GPU-2");
+    CHECK(decide_boot(first, "610.74", "GPU-1") == BootDecision::TooManyStrikes);
+    CHECK(decide_boot(second, "610.74", "GPU-2") == BootDecision::Apply);
 }
 
 TEST_CASE("a failed reset is reported, not claimed as stock") {

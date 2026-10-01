@@ -23,6 +23,7 @@ public:
     bool SetMemOffsetMhz(unsigned gpu, int mhz);
     bool ResetOffsets(unsigned gpu);
     std::optional<std::pair<int, int>> ReadOffsetsMhz(unsigned gpu);  // {core, mem}, MHz
+    std::optional<unsigned> GpuIndexForBusId(unsigned bus_id);
 
     const std::string& Error() const { return error_; }
 

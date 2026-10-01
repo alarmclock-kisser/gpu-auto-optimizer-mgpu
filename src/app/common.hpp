@@ -9,23 +9,32 @@
 #include "core/search.hpp"
 #include "core/types.hpp"
 #include <functional>
+#include <optional>
 #include <string>
+#include <vector>
+
+namespace gao { class Nvml; }
 
 namespace gao::app {
 
-// GPU index is fixed at 0: this machine, like the CLI, handles one NVIDIA GPU.
-inline constexpr unsigned kGpu = 0;
+struct GpuInfo {
+    unsigned index = 0;         // current NVML index; never persisted
+    std::string uuid;           // stable device identity
+    std::string name;
+};
 
 bool is_elevated();
 std::string now_text();   // local time, "YYYY-MM-DD HH:MM"
 Config load_config();
 bool save_config(const Config& c);
+std::vector<GpuInfo> enumerate_gpus(Nvml& nvml, std::string* why = nullptr);
+std::optional<GpuInfo> resolve_gpu(const std::vector<GpuInfo>& gpus, const Config& config, std::string* why = nullptr);
 void boot_log(const std::string& msg);
 // Creates, or verifies and re-secures, the admin-only state folder. Every
 // elevated command that reads or writes state calls this first.
 bool prepare_state(std::string* why);
 std::string profile_text(const Profile& p);
-std::string decision_text(BootDecision d, const Config& c, const std::string& driver);
+std::string decision_text(BootDecision d, const Profile* profile, const std::string& driver);
 
 // Held (process-wide, across gao.exe and the tray app) for the whole of an
 // optimize: the watchdog must not re-apply the saved tune under a running
@@ -72,20 +81,20 @@ struct OptimizeOutcome {
 // search, and saving the profile. Needs elevation.
 // fan_curve: the curve to drive the fans with during the run and to save
 // as the tested curve; empty means the profile's own (default_curve).
-OptimizeOutcome run_optimize(Preset preset, const OptimizeHooks& hooks, const std::optional<FanCurve>& fan_curve = {});
+OptimizeOutcome run_optimize(Preset preset, const std::string& gpu_uuid, const OptimizeHooks& hooks,
+                             const std::optional<FanCurve>& fan_curve = {});
 
 struct BootApplyOutcome {
     bool applied = false;
-    BootDecision decision = BootDecision::NoProfile;
+    std::vector<std::string> applied_gpus;
+    std::vector<std::string> strike_gpus;
     std::string message;       // what happened, as written to boot.log
-    Profile profile;           // the profile that was applied, when applied
 };
 
-// The logon half of boot-apply: decision (strikes, driver, GPU), strike
-// recorded durably, profile applied. Writes one boot.log line.
+// The logon half of boot-apply, independently for every saved GPU profile.
 BootApplyOutcome apply_at_logon();
-// After the grace period: clears the strike without touching the profile.
-void clear_boot_strike();
+// After the grace period: clears only the strikes recorded for this logon.
+void clear_boot_strikes(const std::vector<std::string>& gpu_uuids);
 
 // Installs the exes into Program Files and registers the logon task (true),
 // or removes both. `message` describes the outcome either way.

@@ -18,6 +18,36 @@ cmake --build --preset asan
 ctest --preset asan               # needs the MSVC bin\Hostx64\x64 folder on PATH
 ```
 
+### Build the Windows x64 executables in Visual Studio
+
+These are native C++ executables, not a .NET assembly. The `default` CMake preset selects the Visual Studio 2026 generator and the x64 architecture. Install Visual Studio 2026 with **Desktop development with C++**, the MSVC x64 toolset, and the CMake tools for Windows.
+
+In Visual Studio, use **File > Open > Folder...** and select the repository root. Let CMake configure the `default` preset, select the `release` build configuration/preset, then build the `gao` and `GpuAutoOptimizer` targets (or build the `ALL_BUILD` target to include tests too). The executables are written to:
+
+```text
+build\Release\gao.exe
+build\Release\GpuAutoOptimizer.exe
+```
+
+The same Release build from a Developer PowerShell at the repository root is:
+
+```powershell
+cmake --preset default
+cmake --build --preset release
+ctest --preset release
+```
+
+If `cmake` is not on `PATH`, use the CMake bundled with Visual Studio 2026:
+
+```powershell
+$cmake = "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
+& "$cmake\cmake.exe" --preset default
+& "$cmake\cmake.exe" --build --preset release
+& "$cmake\ctest.exe" --preset release
+```
+
+To make a release-style zip locally, put `build\Release\gao.exe`, `build\Release\GpuAutoOptimizer.exe`, `README.md` and `LICENSE` in one folder and zip its contents. The CI release workflow stages these same four files and names the archive `GpuAutoOptimizer-<version>-win-x64.zip`; its tagged release also includes a SHA-256 file and provenance attestation. A local build does not automatically create the packaged zip.
+
 Our code builds at `/W4 /permissive-` with warnings as errors; `third_party/` is a system include. Everything is compiled with Control Flow Guard and SDL checks, and both executables are linked CET-compatible and carry an application manifest.
 
 ## Layout
@@ -26,7 +56,7 @@ Our code builds at `/W4 /permissive-` with warnings as errors; `third_party/` is
 src/core/     pure logic: no windows.h, no driver calls, no D3D. Unit-tested in CI.
   types.hpp       Telemetry, GpuControl (the hardware seam), AppliedState
   objectives.*    the four profiles as data
-  config.*        gao.json round-trip
+  config.*        per-GPU settings and gao.json round-trip
   stress_math.*   exact-float stress inputs and the CPU reference result
   stability.*     the stress run loop and its verdict
   journal.*       write-ahead log of clock candidates; a freeze becomes a ceiling
@@ -36,10 +66,10 @@ src/core/     pure logic: no windows.h, no driver calls, no D3D. Unit-tested in 
   task_xml.*      the logon task definition
   fan_curve.*     fan curves, the per-second controller and the FanDriver
 src/hw/       the only code that touches hardware or the OS state folders.
-  nvml.*          telemetry and power limit via NVML
+  nvml.*          telemetry, UUID/name, PCI bus and DXGI LUID via NVML
   nvapi.*         clock offsets via NVAPI, verified by read-back
-  gpu_control.*   wires NVML and NVAPI into GpuControl
-  stress.*        the DX11 compute load; the GPU checks every value it computes
+  gpu_control.*   maps NVML devices to NVAPI handles by PCI bus and wires GpuControl
+  stress.*        the DX11 compute load, matched to the selected GPU by LUID
   app_files.*     gao.json (atomic writes), the crash journal and boot.log, flushed to disk
   boot_task.*     the logon task and the Program Files copy
 src/app/
@@ -74,6 +104,10 @@ The applied offset is always at least one step below the confirmed edge. Profile
 | No undervolting | Locking a voltage point hard-froze the reference RTX 4070, and reshaping the curve gave no measurable gain on a power-limited card. |
 | Fans through NVML, stop zone via the driver | NVIDIA's legacy NVAPI fan API is gone on RTX 20-series and newer; NVML's `nvmlDeviceSetFanSpeed_v2` is public and verified by reading the target back. Below the stop threshold the driver owns the fans, so no failure of this app can leave them stopped. |
 | Tray app plus logon task | Driver settings are volatile: a reboot or driver reset clears them. The logon task starts the tray app, whose watchdog keeps the tune applied; three crashing logons in a row switch it off. |
+| One profile per GPU | Optimizing a card updates only that card's profile. Logon apply and the watchdog operate on every saved profile independently; manual Apply/Revert and the live dashboard target the selected GPU. |
+| Stable GPU identity | NVML UUID is the persisted profile key, PCI bus ID maps to NVAPI, and the NVML LUID maps to the DXGI adapter. Device indices can vary between APIs or boots, so they are resolved at runtime rather than saved as identity. |
+| Per-GPU configuration migration | `gao.json` stores device records keyed by UUID, including each card's profile, fan settings and boot crash strikes, plus the selected UUID. The loader migrates the previous single-profile shape into a device record, preserving existing settings. |
+| Fail closed on ambiguous mapping | If a selected GPU cannot be uniquely mapped between NVML and NVAPI, control reports an error instead of guessing a handle. If its LUID cannot be matched to a DXGI adapter, stress-test setup fails instead of running on a different GPU. |
 | Dear ImGui on DX11 | One small binary with no runtime, and the D3D11 device is in the process anyway for the stress load. |
 
 ## Rules the design depends on
@@ -88,7 +122,7 @@ The applied offset is always at least one step below the confirmed edge. Profile
 
 `core_tests` covers `src/core/` and runs in CI on a GitHub-hosted `windows-2025` runner, once normally and once under AddressSanitizer. CI also builds both executables, so a link error in the hardware layer is caught there.
 
-The hardware layer cannot run in CI (the runner has no GPU). It is checked by hand on the reference RTX 4070 through [hardware-checks.md](hardware-checks.md); record the results there.
+The hardware layer cannot run in CI (the runner has no GPU). It is checked by hand on the reference RTX 4070 through [hardware-checks.md](hardware-checks.md); record the results there. The multi-GPU mapping check requires a system with at least two NVIDIA GPUs and remains a separate manual check.
 
 ## Releases
 

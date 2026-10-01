@@ -223,17 +223,33 @@ void preset_cards(UiState& s) {
 void gpu_card(const UiState& s, const UiActions& act) {
     begin_card("gpu");
     const float top = ImGui::GetCursorPosY();
+    const std::string detect = with_icon(kIconRefresh, "Detect GPUs");
     ImGui::BeginGroup();
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, em() * 0.15f));
-    text_bold(s.gpu_name.empty() ? "No NVIDIA GPU found" : s.gpu_name.c_str(), 1.6f);
+    const auto selected = std::find_if(s.gpus.begin(), s.gpus.end(),
+                                       [&](const app::GpuInfo& gpu) { return gpu.uuid == s.selected_gpu; });
+    const std::string selected_label = selected == s.gpus.end()
+                                           ? (s.selected_gpu.empty() ? "No NVIDIA GPU found" : "Selected GPU unavailable")
+                                           : "GPU " + std::to_string(selected->index) + "  |  " + selected->name;
+    ImGui::SetNextItemWidth(std::max(em() * 10, ImGui::GetContentRegionAvail().x -
+                                                        button_width(detect) - ImGui::GetStyle().ItemSpacing.x));
+    if (ImGui::BeginCombo("##selected_gpu", selected_label.c_str())) {
+        for (const app::GpuInfo& gpu : s.gpus) {
+            const std::string label = "GPU " + std::to_string(gpu.index) + "  |  " + gpu.name;
+            const bool is_selected = gpu.uuid == s.selected_gpu;
+            if (ImGui::Selectable(label.c_str(), is_selected) && act.select_gpu) act.select_gpu(gpu.uuid);
+            if (is_selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
     dim(("Driver " + (s.driver.empty() ? std::string("unknown") : s.driver)).c_str());
     ImGui::PopStyleVar();
     ImGui::EndGroup();
-    const std::string detect = with_icon(kIconRefresh, "Detect GPU");
     align_right(button_width(detect));
     ImGui::SetCursorPosY(top);
     if (ImGui::Button(detect.c_str())) act.detect_gpu();
     ImGui::Spacing();
+    if (!s.gpu_error.empty()) wrapped(kWarn, s.gpu_error);
     telemetry_tiles(s);
     end_card();
 }
@@ -319,7 +335,7 @@ void tuning_card(const UiState& s, const UiActions& act) {
     ImGui::SameLine(bw - em() * 3.4f);
     ImGui::SetCursorPosY((bh - em() * 1.25f) / 2 - 1);
     // Turning it off never needs a profile; turning it on does.
-    ImGui::BeginDisabled(!s.elevated || (!s.profile && !s.boot_on));
+    ImGui::BeginDisabled(!s.elevated || (!s.has_profiles && !s.boot_on));
     if (toggle("##logon", s.boot_on)) act.set_boot(!s.boot_on);
     ImGui::EndDisabled();
     ImGui::EndChild();

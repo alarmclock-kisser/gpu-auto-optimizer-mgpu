@@ -22,6 +22,7 @@ constexpr unsigned kInitializeId       = 0x0150E828;
 // so it is used here instead of the brief's stated value.
 constexpr unsigned kUnloadId           = 0xD22BDD7E;
 constexpr unsigned kEnumPhysicalGpusId = 0xE5AC921F;
+constexpr unsigned kGetBusIdId         = 0x1BE0B8E5;
 constexpr unsigned kGetPstates20Id     = 0x6FF81213;
 constexpr unsigned kSetPstates20Id     = 0x0F4DAE6B;
 
@@ -49,6 +50,7 @@ typedef void* (*fn_query)(unsigned);
 typedef nvapi_status_t (*fn_initialize)();
 typedef nvapi_status_t (*fn_unload)();
 typedef nvapi_status_t (*fn_enum)(void**, unsigned*);
+typedef nvapi_status_t (*fn_bus_id)(void*, unsigned*);
 typedef nvapi_status_t (*fn_get_pstates20)(void*, void*);
 typedef nvapi_status_t (*fn_set_pstates20)(void*, void*);
 
@@ -89,11 +91,35 @@ bool Nvapi::Init() {
     void* handles[kMaxPhysicalGpus] = {};
     unsigned count = 0;
     if (enum_gpus(handles, &count) != kNvapiOk) { error_ = "NvAPI_EnumPhysicalGPUs failed"; return false; }
+    if (count > kMaxPhysicalGpus) { error_ = "NvAPI_EnumPhysicalGPUs returned too many GPUs"; return false; }
 
     gpus_.assign(handles, handles + count);
     if (gpus_.empty()) { error_ = "NvAPI_EnumPhysicalGPUs returned no GPUs"; return false; }
 
     return true;
+}
+
+std::optional<unsigned> Nvapi::GpuIndexForBusId(unsigned bus_id) {
+    if (!inited_) { error_ = "NVAPI not initialized"; return std::nullopt; }
+    auto get_bus_id = (fn_bus_id)QueryFn(kGetBusIdId);
+    if (!get_bus_id) { error_ = "NvAPI_GPU_GetBusId: nvapi_QueryInterface returned null"; return std::nullopt; }
+    std::optional<unsigned> match;
+    for (size_t i = 0; i < gpus_.size(); ++i) {
+        unsigned current_bus_id = 0;
+        if (get_bus_id(gpus_[i], &current_bus_id) != kNvapiOk) {
+            error_ = "NvAPI_GPU_GetBusId failed";
+            return std::nullopt;
+        }
+        if (current_bus_id == bus_id) {
+            if (match) {
+                error_ = "multiple NVAPI GPUs share the selected PCI bus";
+                return std::nullopt;
+            }
+            match = static_cast<unsigned>(i);
+        }
+    }
+    if (!match) error_ = "NVAPI has no GPU on the selected PCI bus";
+    return match;
 }
 
 void* Nvapi::GpuHandle(unsigned gpu) {

@@ -34,11 +34,12 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 using Microsoft::WRL::ComPtr;
-using gao::app::kGpu;
 
 namespace {
 
@@ -51,6 +52,12 @@ constexpr UINT_PTR kTimerTelemetry = 1;    // 1 s
 constexpr UINT_PTR kTimerWatchdog = 2;     // 30 s
 constexpr UINT_PTR kTimerStrike = 3;       // one-shot, 2 min after a logon apply
 enum MenuId : UINT { kMenuOpen = 1, kMenuReapply, kMenuRevert, kMenuExit };
+
+struct FanRuntime {
+    gao::GpuControl gpu;
+    std::unique_ptr<gao::FanDriver> fan;
+    unsigned nvml_index = 0;
+};
 
 struct App {
     HWND hwnd = nullptr;
@@ -74,14 +81,19 @@ struct App {
     bool hw_lost = false;            // re-create them at hw_retry_at
     ULONGLONG hw_retry_at = 0;
     gao::GpuControl gpu;
+    std::string selected_gpu;
+    std::optional<unsigned> selected_gpu_index;
+    bool selected_gpu_bound = false;
+    std::string selected_gpu_error;
+    std::unordered_map<std::string, std::unique_ptr<FanRuntime>> fans;
 
     gao::gui::UiState ui;
     std::unique_ptr<gao::gui::OptimizeWorker> worker;
-    gao::Watchdog watchdog;
-    bool watch = false;   // keep the saved tune applied (off after a revert or a reset by choice)
+    std::unordered_map<std::string, gao::Watchdog> watchdogs;
+    std::unordered_set<std::string> watched_gpus;
     bool worker_was_running = false;
     bool strike_pending = false;   // a logon apply whose 2-minute grace has not passed yet
-    std::unique_ptr<gao::FanDriver> fan;   // while the curve drives the fans
+    std::vector<std::string> strike_gpus;
     bool told_about_tray = false;  // the "still running in the tray" balloon, once per session
 
     // Crash dumps are written by a thread created up front (a crashing thread
@@ -237,56 +249,159 @@ void tray_menu(int x, int y) {
 
 // ---------------------------------------------------------------- state
 
-// Fans back to the driver and forget the curve driver. Safe to call anywhere.
-void fan_release() {
-    if (g.fan) g.fan->release();
-    g.fan.reset();
+void fan_release(const std::string& gpu_uuid) {
+    const auto it = g.fans.find(gpu_uuid);
+    if (it != g.fans.end()) {
+        it->second->fan->release();
+        g.fans.erase(it);
+    }
+    if (gpu_uuid == g.selected_gpu) g.ui.fan_state = {};
+}
+
+void fan_release_all() {
+    for (auto& [gpu_uuid, runtime] : g.fans) {
+        (void)gpu_uuid;
+        runtime->fan->release();
+    }
+    g.fans.clear();
     g.ui.fan_state = {};
 }
 
-// Starts, updates or stops the curve driver to match gao.json.
-void fan_sync() {
-    const gao::Config cfg = gao::app::load_config();
-    const auto curve = gao::active_fan_curve(cfg);
-    g.ui.fan_available = g.ui.elevated && g.nvml_ok && static_cast<bool>(g.gpu.set_fan_pct);
-    g.ui.fan_control = cfg.fan_control;
-    g.ui.fan_curve = curve;
-    g.ui.fan_tested = cfg.profile ? cfg.profile->fan_curve : std::nullopt;
-    g.ui.fan_min_pct = gao::fan_min_for(cfg, g.nvml_ok ? g.nvml->GpuUuid(kGpu) : std::string(), g.gpu.fan_min_pct);
-    g.ui.fan_max_temp_c = cfg.profile ? gao::objectives_for(cfg.profile->preset).max_temp_c : 75;
-    // A running search drives the fans itself: never take them over mid-run.
-    if (g.worker && g.worker->running()) return;
-    if (!g.ui.fan_available || !cfg.fan_control || !curve || gao::app::tuning_in_progress()) {
-        fan_release();
+const gao::app::GpuInfo* gpu_info(const std::string& uuid) {
+    const auto it = std::find_if(g.ui.gpus.begin(), g.ui.gpus.end(),
+                                 [&](const gao::app::GpuInfo& gpu) { return gpu.uuid == uuid; });
+    return it == g.ui.gpus.end() ? nullptr : &*it;
+}
+
+void fan_sync(const gao::Config& cfg) {
+    const gao::DeviceSettings* selected = gao::find_device(cfg, g.selected_gpu);
+    const auto selected_curve = gao::active_fan_curve(cfg, g.selected_gpu);
+    g.ui.fan_available = g.ui.elevated && g.selected_gpu_bound && static_cast<bool>(g.gpu.set_fan_pct);
+    g.ui.fan_control = selected && selected->fan_control;
+    g.ui.fan_curve = selected_curve;
+    g.ui.fan_tested = selected && selected->profile ? selected->profile->fan_curve : std::nullopt;
+    g.ui.fan_min_pct = gao::fan_min_for(cfg, g.selected_gpu, g.gpu.fan_min_pct);
+    g.ui.fan_max_temp_c = selected && selected->profile
+                              ? gao::objectives_for(selected->profile->preset).max_temp_c
+                              : 75;
+    if (g.worker && g.worker->running()) {
+        fan_release(g.selected_gpu);
         return;
     }
-    if (g.fan) {
-        g.fan->set_curve(*curve, g.ui.fan_max_temp_c);
+    if (gao::app::tuning_in_progress()) {
+        fan_release_all();
         return;
     }
-    // Fans still manual from a killed earlier instance are ours to take back,
-    // not another program's: start from driver control.
-    if (g.gpu.set_fan_auto) g.gpu.set_fan_auto();
-    g.fan = std::make_unique<gao::FanDriver>(g.gpu, *curve, g.ui.fan_max_temp_c, g.ui.fan_min_pct);
+    for (const gao::DeviceSettings& device : cfg.devices) {
+        const auto curve = gao::active_fan_curve(cfg, device.gpu);
+        if (!device.fan_control || !curve || (g.worker && g.worker->running() && device.gpu == g.selected_gpu)) {
+            fan_release(device.gpu);
+            continue;
+        }
+        const gao::app::GpuInfo* info = gpu_info(device.gpu);
+        if (!info || !g.nvml_ok || !g.nvapi_ok) {
+            fan_release(device.gpu);
+            continue;
+        }
+        const auto current = g.fans.find(device.gpu);
+        if (current != g.fans.end() && current->second->nvml_index == info->index) {
+            const int max_temp = device.profile ? gao::objectives_for(device.profile->preset).max_temp_c : 75;
+            current->second->fan->set_curve(*curve, max_temp);
+            continue;
+        }
+        fan_release(device.gpu);
+        std::string why;
+        const auto control = gao::make_gpu_control(*g.nvml, *g.nvapi, info->index, &why);
+        if (!control) {
+            note("Could not map GPU " + device.gpu + " for fan control: " + why, true);
+            if (device.gpu == g.selected_gpu) g.ui.gpu_error = "Fan control could not map this GPU: " + why;
+            continue;
+        }
+        auto runtime = std::make_unique<FanRuntime>();
+        runtime->gpu = *control;
+        runtime->nvml_index = info->index;
+        if (runtime->gpu.set_fan_auto && !runtime->gpu.set_fan_auto()) {
+            note("Could not return GPU " + device.gpu + " fans to driver control: " + g.nvml->Error(), true);
+            continue;
+        }
+        const int max_temp = device.profile ? gao::objectives_for(device.profile->preset).max_temp_c : 75;
+        runtime->fan = std::make_unique<gao::FanDriver>(runtime->gpu, *curve, max_temp,
+                                                        gao::fan_min_for(cfg, device.gpu, runtime->gpu.fan_min_pct));
+        g.fans.emplace(device.gpu, std::move(runtime));
+    }
+    const auto active = g.fans.find(g.selected_gpu);
+    g.ui.fan_state = active == g.fans.end() ? gao::FanState{} : active->second->fan->state();
 }
 
 void refresh_status(bool with_task) {
     g.ui.elevated = gao::app::is_elevated();
-    const gao::Config cfg = gao::app::load_config();
-    g.ui.profile = cfg.profile;
-    g.ui.strikes = cfg.boot_strikes;
+    gao::Config cfg = gao::app::load_config();
+    if (g.nvml_ok) {
+        g.ui.gpu_error.clear();
+        g.ui.gpus = gao::app::enumerate_gpus(*g.nvml, &g.ui.gpu_error);
+        if (cfg.selected_gpu.empty() && !g.ui.gpus.empty()) {
+            cfg.selected_gpu = g.ui.gpus.front().uuid;
+            if (!gao::app::save_config(cfg)) note("Could not save the selected GPU.", true);
+        }
+    } else {
+        g.ui.gpus.clear();
+        g.ui.gpu_error = g.nvml ? g.nvml->Error() : "NVML is not available";
+    }
+    g.ui.selected_gpu = cfg.selected_gpu;
+    const gao::app::GpuInfo* selected = gpu_info(cfg.selected_gpu);
+    const std::optional<unsigned> next_index = selected ? std::optional<unsigned>(selected->index) : std::nullopt;
+    const bool target_changed =
+        g.selected_gpu != cfg.selected_gpu || g.selected_gpu_index != next_index;
+    const std::string previous_error = g.selected_gpu_error;
+    if (target_changed || !g.selected_gpu_bound) {
+        const std::string previous = g.selected_gpu;
+        if (!previous.empty() && previous != cfg.selected_gpu) fan_release(previous);
+        g.selected_gpu = cfg.selected_gpu;
+        g.selected_gpu_index = next_index;
+        g.selected_gpu_bound = false;
+        g.gpu = {};
+        g.selected_gpu_error.clear();
+        if (selected && g.nvml_ok && g.nvapi_ok) {
+            std::string why;
+            if (auto control = gao::make_gpu_control(*g.nvml, *g.nvapi, selected->index, &why)) {
+                g.gpu = *control;
+                g.selected_gpu_bound = true;
+            } else {
+                g.selected_gpu_error = "Could not map this GPU between NVML and NVAPI: " + why;
+            }
+        } else if (selected && !g.nvapi_ok) {
+            g.selected_gpu_error = "NVAPI is not available";
+        }
+        if (!g.selected_gpu_error.empty() && (target_changed || previous_error != g.selected_gpu_error))
+            note(g.selected_gpu_error, true);
+    }
+    if (!g.selected_gpu_error.empty()) g.ui.gpu_error = g.selected_gpu_error;
+    else if (!selected && !cfg.selected_gpu.empty() && g.ui.gpu_error.empty())
+        g.ui.gpu_error = "The saved GPU selection is currently unavailable.";
+    g.ui.has_profiles = std::any_of(cfg.devices.begin(), cfg.devices.end(),
+                                    [](const gao::DeviceSettings& device) { return device.profile.has_value(); });
+    g.ui.profile.reset();
+    g.ui.strikes = 0;
+    if (const gao::DeviceSettings* device = gao::find_device(cfg, cfg.selected_gpu)) {
+        g.ui.profile = device->profile;
+        g.ui.strikes = device->boot_strikes;
+    }
     if (g.nvml_ok) {
         g.ui.driver = g.nvml->DriverVersion();
-        const std::string gpu_id = g.nvml->GpuUuid(kGpu);
-        g.ui.profile_driver_ok = cfg.profile && !g.ui.driver.empty() && g.ui.driver == cfg.profile->driver;
-        g.ui.profile_gpu_ok = cfg.profile && !gpu_id.empty() && gpu_id == cfg.profile->gpu;
+        g.ui.profile_driver_ok = g.ui.profile && !g.ui.driver.empty() && g.ui.driver == g.ui.profile->driver;
+        g.ui.profile_gpu_ok = g.ui.profile && !cfg.selected_gpu.empty() && cfg.selected_gpu == g.ui.profile->gpu;
+    } else {
+        g.ui.driver.clear();
+        g.ui.profile_driver_ok = false;
+        g.ui.profile_gpu_ok = false;
     }
     if (g.gpu.read_applied) g.ui.applied = g.gpu.read_applied();
+    else g.ui.applied.reset();
     const auto log = gao::read_lines(gao::boot_log_path());
     g.ui.boot_log.clear();
     if (log) g.ui.boot_log.assign(log->size() > 200 ? log->end() - 200 : log->begin(), log->end());
     if (with_task) g.ui.boot_on = gao::boot_task_exists();
-    fan_sync();
+    fan_sync(cfg);
 }
 
 // ---------------------------------------------------------------- actions
@@ -294,9 +409,13 @@ void refresh_status(bool with_task) {
 void hw_lost();   // below, with the other hardware helpers
 
 void act_optimize(gao::Preset preset) {
-    fan_release();   // the search drives the fans itself
+    if (g.selected_gpu.empty() || !g.selected_gpu_bound) {
+        note(g.selected_gpu_error.empty() ? "Select an available NVIDIA GPU first." : g.selected_gpu_error, true);
+        return;
+    }
+    fan_release(g.selected_gpu);   // the search drives this GPU's fans itself
     const auto fan = g.ui.optimize_fan ? std::optional<gao::FanCurve>(gao::fan_preset_curve(*g.ui.optimize_fan)) : std::nullopt;
-    g.worker->start(preset, fan);   // the watchdog skips while it runs
+    g.worker->start(preset, g.selected_gpu, fan);   // the watchdog skips while it runs
 }
 
 void act_abort() { g.worker->abort(); }
@@ -328,29 +447,55 @@ bool refuse_while_tuning() {
     return true;
 }
 
+void act_select_gpu(const std::string& gpu_uuid) {
+    if (refuse_while_tuning()) return;
+    const gao::app::GpuInfo* selected = gpu_info(gpu_uuid);
+    if (!selected) { note("That NVIDIA GPU is no longer available.", true); return; }
+    gao::Config cfg = gao::app::load_config();
+    cfg.selected_gpu = gpu_uuid;
+    if (!gao::app::save_config(cfg)) {
+        note("Could not save the selected GPU; the selection was not changed.", true);
+        return;
+    }
+    note("Selected GPU " + std::to_string(selected->index) + ": " + selected->name);
+    refresh_status(false);
+}
+
 void act_apply() {
     if (refuse_while_tuning()) return;
-    if (!g.nvml_ok || !g.nvapi_ok) { note("The NVIDIA driver is not available right now.", true); return; }
+    if (!g.nvml_ok || !g.nvapi_ok || !g.selected_gpu_bound) {
+        note(g.selected_gpu_error.empty() ? "The NVIDIA driver is not available right now." : g.selected_gpu_error, true);
+        return;
+    }
     std::string why;
     if (!gao::app::prepare_state(&why)) { note(why, true); return; }
     gao::Config cfg = gao::app::load_config();
-    cfg.boot_strikes = 0;   // strikes only gate the logon apply
+    gao::DeviceSettings* device = gao::find_device(cfg, g.selected_gpu);
+    if (!device || !device->profile) { note("No saved profile for the selected GPU; optimize it first.", true); return; }
+    device->boot_strikes = 0;   // strikes only gate the logon apply
     const std::string driver = g.nvml_ok ? g.nvml->DriverVersion() : std::string();
-    const auto d = gao::decide_boot(cfg, driver, g.nvml_ok ? g.nvml->GpuUuid(kGpu) : std::string());
-    if (d != gao::BootDecision::Apply) { note("Not applied: " + gao::app::decision_text(d, cfg, driver), true); return; }
-    if (!gao::apply_profile(g.gpu, *cfg.profile, &why)) { note("Not applied: " + why, true); return; }
-    g.watch = true;
-    g.watchdog = gao::Watchdog();
-    note("Applied " + gao::app::profile_text(*cfg.profile));
+    const auto d = gao::decide_boot(*device, driver, g.selected_gpu);
+    if (d != gao::BootDecision::Apply) {
+        note("Not applied: " + gao::app::decision_text(d, device->profile ? &*device->profile : nullptr, driver), true);
+        return;
+    }
+    if (!gao::apply_profile(g.gpu, *device->profile, &why)) { note("Not applied: " + why, true); return; }
+    g.watched_gpus.insert(g.selected_gpu);
+    g.watchdogs[g.selected_gpu] = gao::Watchdog();
+    note("Applied " + gao::app::profile_text(*device->profile));
     refresh_status(false);
 }
 
 void act_revert() {
     if (refuse_while_tuning()) return;
-    if (!g.nvml_ok || !g.nvapi_ok) { note("The NVIDIA driver is not available right now.", true); return; }
+    if (!g.nvml_ok || !g.nvapi_ok || !g.selected_gpu_bound) {
+        note(g.selected_gpu_error.empty() ? "The NVIDIA driver is not available right now." : g.selected_gpu_error, true);
+        return;
+    }
     const bool ok = g.gpu.reset_to_stock && g.gpu.reset_to_stock();
-    g.watch = false;   // stock by choice: the watchdog must not undo it
-    note(ok ? "Back at stock. The saved tune is not re-applied until you apply it again."
+    g.watched_gpus.erase(g.selected_gpu);   // stock by choice: do not re-apply this GPU
+    g.watchdogs.erase(g.selected_gpu);
+    note(ok ? "The selected GPU is back at stock. Its saved tune is not re-applied until you apply it again."
             : "Reset to stock FAILED; try gao --reset.",
          !ok);
     refresh_status(false);
@@ -374,23 +519,26 @@ void render() {
     act.apply_profile = act_apply;
     act.revert_to_stock = act_revert;
     act.set_boot = act_boot;
+    act.select_gpu = act_select_gpu;
     act.set_fan_curve = [](const gao::FanCurve& curve) {
         if (!gao::valid(curve)) return;
         gao::Config cfg = gao::app::load_config();
-        cfg.fan_curve = curve;
+        if (g.selected_gpu.empty()) { note("Select an NVIDIA GPU before editing its fan curve.", true); return; }
+        gao::ensure_device(cfg, g.selected_gpu).fan_curve = curve;
         if (!gao::app::save_config(cfg)) note("Could not save the fan curve.", true);
         refresh_status(false);
     };
     act.set_fan_control = [](bool on) {
         gao::Config cfg = gao::app::load_config();
-        cfg.fan_control = on;
+        if (g.selected_gpu.empty()) { note("Select an NVIDIA GPU before changing fan control.", true); return; }
+        gao::ensure_device(cfg, g.selected_gpu).fan_control = on;
         if (!gao::app::save_config(cfg)) note("Could not save the fan setting; nothing changed.", true);
         else note(on ? "Fan curve on." : "Fan curve off; the NVIDIA driver controls the fans.");
         refresh_status(false);
     };
     act.reset_fan_curve = [] {
         gao::Config cfg = gao::app::load_config();
-        cfg.fan_curve.reset();
+        if (gao::DeviceSettings* device = gao::find_device(cfg, g.selected_gpu)) device->fan_curve.reset();
         if (!gao::app::save_config(cfg)) note("Could not save the fan curve.", true);
         refresh_status(false);
     };
@@ -421,7 +569,6 @@ void init_hw() {
     g.nvapi = std::make_unique<gao::Nvapi>();
     g.nvml_ok = g.nvml->Init();
     g.nvapi_ok = g.nvapi->Init();
-    g.gpu = g.nvml_ok && g.nvapi_ok ? gao::make_gpu_control(*g.nvml, *g.nvapi, kGpu) : gao::GpuControl{};
 }
 
 // Structured exceptions, not C++ ones: an access violation inside a driver DLL.
@@ -445,9 +592,11 @@ template <class F> bool guarded(F f) {
 void hw_lost() {
     // Never call into a library that may just have faulted; after a reset the
     // driver owns the fans again anyway.
-    g.fan.reset();
+    g.fans.clear();
     g.ui.fan_state = {};
     g.gpu = {};
+    g.selected_gpu_index.reset();
+    g.selected_gpu_bound = false;
     g.nvml_ok = g.nvapi_ok = false;
     g.hw_lost = true;
     g.hw_retry_at = GetTickCount64() + 5000;
@@ -477,33 +626,41 @@ void on_telemetry() {
     if (g.device_lost || reset) recover_device();
     if (reset && !g.hw_lost) hw_lost();
     retry_hw();
-    if (g.nvml_ok) {
-        g.ui.telemetry = g.nvml->Read(kGpu);
+    if (g.nvml_ok && g.selected_gpu_index) {
+        g.ui.telemetry = g.nvml->Read(*g.selected_gpu_index);
         gao::gui::push_history(g.ui.temp_history, static_cast<float>(std::max(g.ui.telemetry.temp_c, 0)));
         gao::gui::push_history(g.ui.power_history, static_cast<float>(std::max(g.ui.telemetry.power_w, 0)));
+    } else {
+        g.ui.telemetry = {};
     }
-    // The curve, while nothing else owns the fans: a search drives them itself.
-    if (g.fan && !g.worker->running() && !gao::app::tuning_in_progress()) {
-        const gao::FanMode before = g.fan->state().mode;
-        g.ui.fan_state = g.fan->tick(g.ui.telemetry.temp_c, g.ui.telemetry.power_w, std::chrono::steady_clock::now());
-        if (g.ui.fan_state.min_pct > g.ui.fan_min_pct && g.ui.fan_state.mode == gao::FanMode::Curve) {
-            // The fans stalled at the old minimum: remember the new one for this card.
-            g.ui.fan_min_pct = g.ui.fan_state.min_pct;
-            gao::Config cfg = gao::app::load_config();
-            cfg.fan_min_pct = g.ui.fan_min_pct;
-            cfg.fan_min_gpu = g.nvml->GpuUuid(kGpu);
-            if (!gao::app::save_config(cfg)) note("Could not save the learned fan minimum.", true);
-            note("The fans stalled below " + std::to_string(g.ui.fan_min_pct) + " %; that is their minimum from now on.");
+    if (!g.worker->running() && !gao::app::tuning_in_progress()) {
+        const auto now = std::chrono::steady_clock::now();
+        const gao::Config fan_cfg = gao::app::load_config();
+        for (auto& [gpu_uuid, runtime] : g.fans) {
+            const gao::Telemetry fan_telemetry = runtime->gpu.read();
+            const gao::FanMode before = runtime->fan->state().mode;
+            const gao::FanState state = runtime->fan->tick(fan_telemetry.temp_c, fan_telemetry.power_w, now);
+            if (gpu_uuid == g.selected_gpu) g.ui.fan_state = state;
+            if (state.min_pct > gao::fan_min_for(fan_cfg, gpu_uuid, runtime->gpu.fan_min_pct) &&
+                state.mode == gao::FanMode::Curve) {
+                gao::Config cfg = fan_cfg;
+                gao::ensure_device(cfg, gpu_uuid).fan_min_pct = state.min_pct;
+                if (!gao::app::save_config(cfg)) note("Could not save the learned fan minimum for GPU " + gpu_uuid, true);
+                else note("GPU " + gpu_uuid + " fan minimum learned at " + std::to_string(state.min_pct) + " %.");
+                if (gpu_uuid == g.selected_gpu) g.ui.fan_min_pct = state.min_pct;
+            }
+            if (state.mode != before && state.mode == gao::FanMode::Failed)
+                notify("A fan speed did not verify on GPU " + gpu_uuid +
+                       "; the NVIDIA driver controls its fans again. Fan control is off until the app restarts.");
+            if (state.mode != before && state.mode == gao::FanMode::Foreign)
+                notify("Another program changed the fan speed on GPU " + gpu_uuid + ". Leaving its fans alone.");
         }
-        if (g.ui.fan_state.mode != before && g.ui.fan_state.mode == gao::FanMode::Failed)
-            notify("A fan speed did not verify, so the NVIDIA driver controls the fans again. Fan control is off until the app restarts.");
-        if (g.ui.fan_state.mode != before && g.ui.fan_state.mode == gao::FanMode::Foreign)
-            notify("Another program (Afterburner, NVIDIA App...) set the fan speed. Leaving the fans alone.");
     }
     if (g.gpu.read_applied) g.ui.applied = g.gpu.read_applied();
     wchar_t tip[128];
     const gao::Telemetry& t = g.ui.telemetry;
-    swprintf_s(tip, L"GPU Auto Optimizer\n%d C, %d MHz%s", t.temp_c, t.core_mhz, g.watch ? L", tune kept applied" : L"");
+    swprintf_s(tip, L"GPU Auto Optimizer\n%d C, %d MHz%s", t.temp_c, t.core_mhz,
+               g.watched_gpus.contains(g.selected_gpu) ? L", tune kept applied" : L"");
     tray_icon(NIM_MODIFY, tip);
     // A finished optimize run: its result is applied, so watch it from now on.
     const bool running = g.worker->running();
@@ -512,8 +669,13 @@ void on_telemetry() {
         // A run that never started left the GPU alone: keep watching as before.
         // One that ran ends either at its saved result or at stock.
         if (snap.outcome && snap.outcome->ran) {
-            g.watch = snap.outcome->result.ok && snap.outcome->saved;
-            g.watchdog = gao::Watchdog();
+            if (snap.outcome->result.ok && snap.outcome->saved) {
+                g.watched_gpus.insert(g.selected_gpu);
+                g.watchdogs[g.selected_gpu] = gao::Watchdog();
+            } else {
+                g.watched_gpus.erase(g.selected_gpu);
+                g.watchdogs.erase(g.selected_gpu);
+            }
         }
         refresh_status(false);
     }
@@ -522,46 +684,73 @@ void on_telemetry() {
 
 void on_watchdog() {
     // Never under a running search -- ours, or gao --optimize in a shell.
-    if (!g.watch || g.worker->running() || gao::app::tuning_in_progress()) return;
+    if (g.watched_gpus.empty() || g.worker->running() || gao::app::tuning_in_progress()) return;
     if (!g.ui.elevated || !g.nvml_ok || !g.nvapi_ok) return;
     const gao::Config cfg = gao::app::load_config();
-    if (!cfg.profile) return;
-    const auto applied = g.gpu.read_applied();
-    if (!applied) {   // NVAPI handles go stale after a driver reset: re-create
-        hw_lost();
-        return;
-    }
-    const std::string driver = g.nvml->DriverVersion(), gpu_id = g.nvml->GpuUuid(kGpu);
-    const auto action = g.watchdog.check(*cfg.profile, applied, !driver.empty() && driver == cfg.profile->driver,
-                                         !gpu_id.empty() && gpu_id == cfg.profile->gpu, std::chrono::steady_clock::now());
-    switch (action) {
-        case gao::WatchAction::None: return;
-        case gao::WatchAction::Reapply: {
-            std::string why;
-            if (gao::apply_profile(g.gpu, *cfg.profile, &why)) {
-                gao::app::boot_log("watchdog: the tune had been reset (driver reset or TDR); re-applied");
-                notify("The tune had been reset (driver reset or TDR) and was re-applied.", false);
-            } else {
-                gao::app::boot_log("watchdog: re-apply failed: " + why);
-                notify("The tune had been reset and could not be re-applied: " + why, false);
+    const std::string driver = g.nvml->DriverVersion();
+    const auto now = std::chrono::steady_clock::now();
+    bool changed = false;
+    const std::vector<std::string> watched(g.watched_gpus.begin(), g.watched_gpus.end());
+    for (const std::string& gpu_uuid : watched) {
+        const gao::Profile* profile = gao::find_profile(cfg, gpu_uuid);
+        if (!profile) continue;
+        const gao::app::GpuInfo* info = gpu_info(gpu_uuid);
+        if (!info) {
+            const auto action = g.watchdogs[gpu_uuid].check(*profile, std::nullopt, !driver.empty() && driver == profile->driver,
+                                                            false, now);
+            if (action == gao::WatchAction::NotifyDriverChanged) {
+                notify("GPU " + gpu_uuid + " is unavailable; its saved tune was not reapplied.");
+                changed = true;
             }
-            break;
+            continue;
         }
-        case gao::WatchAction::GiveUpUnstable:
-            gao::app::boot_log("watchdog: reset 4 times within an hour; stopped re-applying");
-            notify("The tune keeps getting reset (4 times within an hour), which usually means it is not stable. "
-                   "Stopped re-applying it; optimize again.",
-                   false);
-            break;
-        case gao::WatchAction::BackOffForeign:
-            gao::app::boot_log("watchdog: another program changed the GPU settings; leaving them alone");
-            notify("Another program (Afterburner, NVIDIA App...) changed the GPU settings. Leaving them alone.", false);
-            break;
-        case gao::WatchAction::NotifyDriverChanged:
-            notify("The NVIDIA driver or the card changed since the tune was made. Optimize again to tune for it.");
-            break;
+        std::string why;
+        const auto control = gao::make_gpu_control(*g.nvml, *g.nvapi, info->index, &why);
+        if (!control) {
+            const auto action = g.watchdogs[gpu_uuid].check(*profile, std::nullopt, false, true, now);
+            if (action == gao::WatchAction::NotifyDriverChanged) {
+                notify("Could not monitor GPU " + gpu_uuid + ": " + why);
+                changed = true;
+            }
+            continue;
+        }
+        const auto applied = control->read_applied();
+        if (!applied) {
+            hw_lost();
+            return;
+        }
+        const auto action = g.watchdogs[gpu_uuid].check(*profile, applied, !driver.empty() && driver == profile->driver,
+                                                        true, now);
+        switch (action) {
+            case gao::WatchAction::None: break;
+            case gao::WatchAction::Reapply:
+                if (gao::apply_profile(*control, *profile, &why)) {
+                    gao::app::boot_log("watchdog: GPU " + gpu_uuid + " tune reset; re-applied");
+                    notify("GPU " + gpu_uuid + " tune was reset and re-applied.", false);
+                } else {
+                    gao::app::boot_log("watchdog: GPU " + gpu_uuid + " re-apply failed: " + why);
+                    notify("GPU " + gpu_uuid + " tune was reset and could not be re-applied: " + why, false);
+                }
+                changed = true;
+                break;
+            case gao::WatchAction::GiveUpUnstable:
+                gao::app::boot_log("watchdog: GPU " + gpu_uuid + " reset 4 times within an hour; stopped re-applying");
+                notify("GPU " + gpu_uuid + " keeps resetting (4 times within an hour). Stopped re-applying it; optimize again.",
+                       false);
+                changed = true;
+                break;
+            case gao::WatchAction::BackOffForeign:
+                gao::app::boot_log("watchdog: another program changed GPU " + gpu_uuid + "; leaving it alone");
+                notify("Another program changed GPU " + gpu_uuid + ". Leaving its settings alone.", false);
+                changed = true;
+                break;
+            case gao::WatchAction::NotifyDriverChanged:
+                notify("The NVIDIA driver or GPU " + gpu_uuid + " changed since its tune was made. Optimize again.");
+                changed = true;
+                break;
+        }
     }
-    refresh_status(false);
+    if (changed) refresh_status(false);
 }
 
 // ---------------------------------------------------------------- window
@@ -572,7 +761,8 @@ void clear_strike() {
     if (!g.strike_pending) return;
     g.strike_pending = false;
     KillTimer(g.hwnd, kTimerStrike);
-    gao::app::clear_boot_strike();
+    gao::app::clear_boot_strikes(g.strike_gpus);
+    g.strike_gpus.clear();
 }
 
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -582,13 +772,18 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == g.tray_notice && g.tray_notice) {   // gao --reset / gao --apply in a shell
+        const std::string selected_gpu = gao::app::load_config().selected_gpu;
         if (wp == static_cast<WPARAM>(gao::app::TrayNotice::TuneApplied)) {
-            g.watch = true;
-            g.watchdog = gao::Watchdog();
-            note("Applied from the command line; kept applied from now on.");
+            if (!selected_gpu.empty()) {
+                g.watched_gpus.insert(selected_gpu);
+                g.watchdogs[selected_gpu] = gao::Watchdog();
+            }
+            note("Applied from the command line; the selected GPU will be kept tuned.");
         } else {
-            g.watch = false;
-            note("Set to stock from the command line; not re-applied until you apply it again.", true);
+            g.watched_gpus.erase(selected_gpu);
+            g.watchdogs.erase(selected_gpu);
+            note("The selected GPU was set to stock from the command line; it will not be reapplied until you apply it again.",
+                 true);
         }
         refresh_status(false);
         return 0;
@@ -660,15 +855,15 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_ENDSESSION:
             if (wp) {   // the session really ends: stock now, the run cannot finish
                 clear_strike();
-                fan_release();
+                fan_release_all();
                 if (g.worker->running() && g.gpu.reset_to_stock) g.gpu.reset_to_stock();
-                // A run drives the fans itself (g.fan is empty then): hand them back too.
+                // A run drives the selected GPU's fans itself: hand them back too.
                 if (g.worker->running() && g.gpu.set_fan_auto) g.gpu.set_fan_auto();
             }
             return 0;
         case WM_POWERBROADCAST:
             if (wp == PBT_APMSUSPEND) {   // never sleep with a manual speed, ours or a run's
-                fan_release();
+                fan_release_all();
                 if (g.worker->running() && g.gpu.set_fan_auto) g.gpu.set_fan_auto();
             }
             else if (wp == PBT_APMRESUMEAUTOMATIC) refresh_status(false);   // take the curve up again
@@ -749,7 +944,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
 
     g.worker = std::make_unique<gao::gui::OptimizeWorker>([] { PostMessageW(g.hwnd, WM_APP_WAKE, 0, 0); });
     init_hw();
-    g.ui.gpu_name = gao::nvidia_adapter_name();
 
     tray_icon(NIM_ADD);
     refresh_status(true);
@@ -757,13 +951,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
         std::string why;
         if (gao::app::prepare_state(&why)) {
             const auto logon = gao::app::apply_at_logon();
-            if (logon.applied) {
-                g.watch = true;
+            for (const std::string& gpu_uuid : logon.applied_gpus) {
+                g.watched_gpus.insert(gpu_uuid);
+                g.watchdogs[gpu_uuid] = gao::Watchdog();
+            }
+            g.strike_gpus = logon.strike_gpus;
+            if (!g.strike_gpus.empty()) {
                 g.strike_pending = true;
                 SetTimer(g.hwnd, kTimerStrike, 2 * 60 * 1000, nullptr);
-            } else if (logon.decision != gao::BootDecision::NoProfile) {
-                notify(logon.message, false);   // apply_at_logon wrote boot.log
             }
+            const auto cfg = gao::app::load_config();
+            const size_t profiles = static_cast<size_t>(std::count_if(
+                cfg.devices.begin(), cfg.devices.end(), [](const gao::DeviceSettings& d) { return d.profile.has_value(); }));
+            if (!logon.message.empty() && logon.applied_gpus.size() < profiles)
+                notify("Some GPU profiles were not applied at logon. See the app log for details.", false);
         }
         refresh_status(false);
     }
@@ -788,7 +989,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int) {
         if (quit) break;
         if (g.exit_requested && !g.worker->running()) {
             clear_strike();
-            fan_release();
+            fan_release_all();
             DestroyWindow(g.hwnd);
             continue;
         }
